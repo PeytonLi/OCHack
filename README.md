@@ -28,7 +28,9 @@ For development/testing, all providers are injected as fakes — no env vars nee
 uvicorn skill_orchestrator.app:app --host 0.0.0.0 --port 8000
 ```
 
-Note: Production use requires configuring `set_adapters()` with real provider implementations at startup.
+For local production-style runs, copy `.env.example` to `.env`, fill in your real keys, and start Uvicorn. The app now auto-loads `.env` at startup and builds the production adapters when all required values are present.
+
+Note: If the required settings are missing or still placeholders, the API starts in unconfigured mode and `POST /resolve-skill-and-run` returns `Service not configured`.
 
 ## Publish to ClawHub
 

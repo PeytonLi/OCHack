@@ -35,6 +35,7 @@ Thumbs.db
 # Local secrets/config
 .env
 .env.*
+!.env.example
 *.pem
 *.key
 
