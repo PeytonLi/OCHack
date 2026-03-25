@@ -1,64 +1,69 @@
-# Skill Orchestrator
+# AutoSkill
 
-Self-evolving skill orchestration service. An agent can detect missing capabilities, discover or generate skills, validate trust/safety, publish, execute, and reuse skills across agents.
+AutoSkill is a ClawHub/Claude skill backed by the `skill_orchestrator` service in `src/`. It detects capability gaps, searches for reusable skills, synthesizes new ones when needed, verifies trust and safety, and caches successful resolutions for reuse across agents.
 
-## Setup
+## Quick Start
+
+Install the skill package:
+
+```bash
+clawhub install PeytonLi/OCHack
+```
+
+Start a new Claude Code session. The SessionStart hook will launch the local service on port `8321`, expose the `auto-skill` command from `skills/auto-skill/SKILL.md`, and keep the service healthy through `GET /health`.
+
+If you want real provider integrations, copy `.env.example` to `.env` and fill in the keys you want to enable. The packaged service can still start without those credentials by falling back to environment-backed stubs.
+
+## Local Development
 
 ```bash
 pip install -r requirements.txt
+python -m pytest tests/ -v
+python demo.py
+bash scripts/start-service.sh start
+bash scripts/start-service.sh status
+bash scripts/start-service.sh stop
 ```
 
-## Required Environment Variables
+To run the API directly instead of using the hook:
 
-For production use, configure these provider credentials:
+```bash
+PYTHONPATH=src uvicorn skill_orchestrator.app:app --host 127.0.0.1 --port 8321
+```
+
+## Configuration
+
+Set `FRIENDLI_API_KEY` to enable production bootstrap. Additional providers are opt-in through `ENABLE_APIFY`, `ENABLE_CONTEXTUAL`, `ENABLE_CIVIC`, and `ENABLE_REDIS`; when a provider is disabled, the service falls back to local implementations where possible.
 
 | Variable | Provider | Purpose |
 |----------|----------|---------|
 | `FRIENDLI_API_KEY` | Friendli | Capability gap detection, draft skill generation |
-| `APIFY_API_TOKEN` | Apify | ClawHub search support, docs crawling fallback |
+| `APIFY_API_TOKEN` | Apify | ClawHub search support, documentation crawling |
 | `CONTEXTUAL_API_KEY` | Contextual AI | Grounded schema extraction, confidence scoring |
 | `CIVIC_API_KEY` | Civic | Trust verification, policy authority |
-| `REDIS_URL` | Redis | Short-term cross-agent memory (default: `redis://localhost:6379`) |
+| `REDIS_URL` | Redis | Cross-agent memory cache |
 
-For development/testing, all providers are injected as fakes — no env vars needed.
-
-## Run
+## API
 
 ```bash
-uvicorn skill_orchestrator.app:app --host 0.0.0.0 --port 8000
+curl -sf http://localhost:8321/health
+
+curl -s -X POST http://localhost:8321/resolve-skill-and-run \
+  -H "Content-Type: application/json" \
+  -d '{"capability": "parse-csv", "input_data": {}, "agent_id": "claude-code"}'
+
+curl -s http://localhost:8321/metrics
 ```
 
-For local production-style runs, copy `.env.example` to `.env`, fill in your real keys, and start Uvicorn. The app now auto-loads `.env` at startup and builds the production adapters when all required values are present.
-
-Note: If the required settings are missing or still placeholders, the API starts in unconfigured mode and `POST /resolve-skill-and-run` returns `Service not configured`.
-
 ## Publish to ClawHub
+
+The packaged skill manifest lives at `skills/auto-skill/SKILL.md`.
 
 ```bash
 clawhub login
 clawhub inspect .
 clawhub publish .
 ```
-
-After publish succeeds, install from another machine or agent environment:
-
-```bash
-clawhub install <your-skill-slug>
-```
-
-To verify installation quickly, run:
-
-```bash
-python demo.py
-```
-
-## Test
-
-```bash
-python -m pytest tests/ -v
-```
-
-All 24 tests run with in-memory fakes — no external services required.
 
 ## Architecture
 
@@ -68,50 +73,37 @@ POST /resolve-skill-and-run
          ▼
   CapabilityRouter.resolve_and_run()
          │
-         ├─ 1. CapabilityDetector (Friendli) — is this capability known?
+         ├─ 1. CapabilityDetector (Friendli) - is this capability known?
          │     └─ known → return cached result
          │
-         ├─ 2. SkillCache (Redis) — cross-agent memory lookup
+         ├─ 2. SkillCache (Redis) - cross-agent memory lookup
          │     └─ hit → return cached result
          │
-         ├─ 3. SkillRegistry (ClawHub) — retrieval search
+         ├─ 3. SkillRegistry (ClawHub) - retrieval search
          │     └─ found → TrustVerifier (Civic) gate → sandbox → return
          │
          └─ 4. SynthesisPipeline (no retrieval match)
-               ├─ DocsCrawler (Apify) — crawl documentation
-               ├─ GroundingProvider (Contextual AI) — extract schema + score
-               ├─ CapabilityDetector (Friendli) — generate draft
+               ├─ DocsCrawler (Apify) - crawl documentation
+               ├─ GroundingProvider (Contextual AI) - extract schema + score
+               ├─ CapabilityDetector (Friendli) - generate draft
                ├─ Confidence threshold check (stricter for high-risk)
                ├─ License allowlist check
-               ├─ TrustVerifier (Civic) — hard block gate
-               ├─ RuntimeSandbox — install, healthcheck, execute
+               ├─ TrustVerifier (Civic) - hard block gate
+               ├─ RuntimeSandbox - install, healthcheck, execute
                │     └─ healthcheck fail → publish as QUARANTINED
                └─ Publish as ACTIVE, cache in Redis
 
+GET /health  → service readiness check
 GET /metrics → telemetry counters
 ```
 
-### Modules
-
-| Module | Responsibility |
-|--------|---------------|
-| `CapabilityRouter` | Orchestrates the full resolution flow |
-| `DiscoveryEngine` | Retrieval-first strategy (cache → ClawHub) |
-| `GroundingEngine` | Schema extraction and confidence scoring (Contextual AI) |
-| `TrustEngine` | Civic verification — hard block authority |
-| `SynthesisPipeline` | Docs → draft → validate → publish chain |
-| `RuntimeSandbox` | Sandbox install, healthcheck, execute, rollback |
-| `SkillMemory` | Redis-backed cross-agent cache |
-| `PublishEngine` | Active/quarantined state transitions |
-| `TelemetryAudit` | MTTC, block rate, quarantine count, cache-hit ratio |
-
 ### Key Behaviors
 
-1. **Retrieval-first**: Local cache and ClawHub before synthesis
-2. **Civic hard block**: Trust verification failure blocks install/execute/publish
-3. **Quarantine path**: Policy passes but smoke test fails → published as quarantined
-4. **Retry with backoff**: One automatic retry for transient verify/network failures
-5. **Partial success**: Capability-gap report with completed step results when resolution fails
-6. **High-risk thresholds**: Shell/network/filesystem skills require confidence >= 0.9
-7. **License allowlist**: Only MIT, Apache-2.0, BSD, ISC, Unlicense, CC0 permitted
-8. **Global cache**: Redis provides cross-agent memory reuse for MVP
+1. Retrieval-first: local cache and ClawHub before synthesis
+2. Civic hard block: trust verification failure blocks install, execute, and publish
+3. Quarantine path: policy passes but smoke test fails -> published as quarantined
+4. Retry with backoff: one automatic retry for transient verify/network failures
+5. Partial success: capability-gap report with completed step results when resolution fails
+6. High-risk thresholds: shell, network, filesystem, and exec skills require confidence >= 0.9
+7. License allowlist: only MIT, Apache-2.0, BSD, ISC, Unlicense, and CC0 permitted
+8. Global cache: Redis provides cross-agent memory reuse

@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from contextlib import asynccontextmanager
+import logging
 import time
+from contextlib import asynccontextmanager
 from typing import Iterable, Optional
 
 from fastapi import FastAPI, Request
@@ -12,6 +13,8 @@ from skill_orchestrator.models import SkillRequest, SkillResponse
 from skill_orchestrator.router import CapabilityRouter
 from skill_orchestrator.settings import Settings, has_required_settings, load_settings
 from skill_orchestrator.telemetry import telemetry
+
+logger = logging.getLogger(__name__)
 
 
 def set_adapters(
@@ -55,6 +58,10 @@ def create_app(
     configured_app.state.router = None
     configured_app.state.closeables = []
 
+    @configured_app.get("/health")
+    async def health() -> dict:
+        return {"status": "ok"}
+
     @configured_app.post("/resolve-skill-and-run", response_model=SkillResponse)
     async def resolve_skill_and_run(
         payload: SkillRequest, request: Request
@@ -71,7 +78,7 @@ def create_app(
         response = await router.resolve_and_run(payload)
         duration = time.monotonic() - start
 
-        # Track outcomes
+        # Track outcomes.
         if response.success:
             telemetry.record_resolution(duration)
         if response.error and "trust" in response.error.lower():
@@ -85,7 +92,8 @@ def create_app(
             response.resolution_strategy
             and response.resolution_strategy.value == "local_cache"
         ):
-            # Cache hit if the capability was unknown (not the known-capability fast path).
+            # Cache hit if the capability was unknown (not the known-capability
+            # fast path).
             pass  # Handled in router
 
         return response
@@ -125,13 +133,42 @@ async def _close_all(requested_closeables: Iterable[object]) -> None:
                 await maybe_result
 
 
+def _configure_env_fallbacks(target_app: FastAPI) -> None:
+    from skill_orchestrator.adapters.env_adapters import (
+        EnvCapabilityDetector,
+        EnvDocsCrawler,
+        EnvGroundingProvider,
+        EnvRuntimeSandbox,
+        EnvSkillCache,
+        EnvSkillRegistry,
+        EnvTrustVerifier,
+    )
+
+    logger.info(
+        "Configuration incomplete; using environment-backed fallback adapters"
+    )
+    set_adapters(
+        capability_detector=EnvCapabilityDetector(),
+        skill_registry=EnvSkillRegistry(),
+        docs_crawler=EnvDocsCrawler(),
+        grounding_provider=EnvGroundingProvider(),
+        trust_verifier=EnvTrustVerifier(),
+        skill_cache=EnvSkillCache(),
+        runtime_sandbox=EnvRuntimeSandbox(),
+        target_app=target_app,
+    )
+
+
 def _build_default_app() -> FastAPI:
-    if has_required_settings():
-        try:
+    try:
+        if has_required_settings():
             return create_app(load_settings())
-        except ConfigurationError:
-            pass
-    return create_app()
+    except ConfigurationError:
+        logger.exception("Falling back to environment-backed adapters")
+
+    configured_app = create_app()
+    _configure_env_fallbacks(configured_app)
+    return configured_app
 
 
 app = _build_default_app()

@@ -3,7 +3,29 @@
     "allow": [
       "Bash(\"/c/Users/lipey/AppData/Local/Programs/Python/Python313/python.exe\" -m pytest tests/test_c7_telemetry.py -v --tb=short)",
       "Bash(\"/c/Users/lipey/AppData/Local/Programs/Python/Python313/python.exe\" demo.py)",
-      "Bash(\"/c/Users/lipey/AppData/Local/Programs/Python/Python313/python.exe\" -m pytest tests/ -v)"
+      "Bash(\"/c/Users/lipey/AppData/Local/Programs/Python/Python313/python.exe\" -m pytest tests/ -v)",
+      "Read(//c/Users/lipey/.claude/**)",
+      "Bash(find /c/Users/lipey/.claude -type f -name *.json -o -name *.md)",
+      "Bash(find c:/Users/lipey/Code/OCHack/src -type f -name *.py)",
+      "Read(//c/Users/lipey/.agents/skills/**)",
+      "Read(//c/Users/lipey/.agents/skills/grill-me/**)",
+      "Read(//c/Users/lipey/.agents/**)",
+      "Read(//c/Users/lipey/**)",
+      "Bash(find /c/Users/lipey/.claude -type f -name hooks* -o -name *hook*)",
+      "Bash(find ~/.agents/skills -type f \\\\\\(-name SKILL.md -o -name *.json \\\\\\))",
+      "Bash(find /c/Users/lipey/Code/OCHack/src -type f -name *.py)",
+      "Bash(grep -r slash /c/Users/lipey/.claude/plugins/cache/claude-plugins-official/superpowers/5.0.5/ --include=*.md)",
+      "Bash(grep -r \"disable-model-invocation\\\\|disable_model_invocation\" /c/Users/lipey/.claude/plugins/cache/claude-plugins-official/superpowers/5.0.5/ --include=*.md)",
+      "Bash(ls -lt ~/.claude/backups/.claude.json.backup*)",
+      "Bash(find /c/Users/lipey/.agents -type f -name *.md)",
+      "Bash(grep -r \"invoke.*skill\\\\|/[A-Za-z]\" /c/Users/lipey/.claude/plugins/cache/claude-plugins-official/superpowers/5.0.5/ --include=*.md)",
+      "Bash(find /c/Users/lipey/.claude/projects -name memory.md -o -name *.memory)",
+      "Bash(find /c/Users/lipey/.claude/plugins/marketplaces/claude-plugins-official/plugins -type f -name *.json)",
+      "Bash(find /c/Users/lipey/.claude/plugins/marketplaces/claude-plugins-official/plugins -type f -name *.md -path */agents/*)",
+      "Bash(grep -l \"invoke\\\\|skill\\\\|hook\" /c/Users/lipey/.claude/plugins/marketplaces/claude-plugins-official/plugins/plugin-dev/agents/*.md)",
+      "Bash(find /c/Users/lipey/.claude/plugins -type f -not -path */.git/*)",
+      "Bash(find /c/Users/lipey/.agents -type f -not -path */.git/*)",
+      "Bash(find /c/Users/lipey/.claude/plugins/marketplaces -type f -name *.json)"
     ]
   }
 }

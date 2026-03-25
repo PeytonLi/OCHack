@@ -1,0 +1,39 @@
+{
+  "name": "auto-skill",
+  "version": "0.1.0",
+  "author": "PeytonLi",
+  "description": "Self-evolving skill orchestrator that detects capability gaps, discovers or generates skills, validates trust/safety, and executes them across agents.",
+  "license": "MIT",
+  "keywords": [
+    "skill-orchestration",
+    "capability-gap",
+    "auto-discovery",
+    "trust-verification",
+    "clawhub"
+  ],
+  "repository": "https://github.com/PeytonLi/OCHack",
+  "runtime": {
+    "type": "background-service",
+    "port": 8321,
+    "healthcheck": "/health",
+    "requires": {
+      "python": ">=3.9"
+    }
+  },
+  "skills": [
+    "skills/auto-skill/SKILL.md"
+  ],
+  "hooks": {
+    "config": "hooks/hooks.json"
+  },
+  "env": {
+    "required": [],
+    "optional": [
+      "FRIENDLI_API_KEY",
+      "APIFY_API_TOKEN",
+      "CONTEXTUAL_API_KEY",
+      "CIVIC_API_KEY",
+      "REDIS_URL"
+    ]
+  }
+}
