@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pip --version)",
+      "Bash(python -c \"import pytest; print\\(pytest.__file__\\)\")",
+      "Bash(\"/c/Users/lipey/AppData/Local/Programs/Python/Python313/python.exe\" -c \"import pytest, fastapi, httpx; print\\(''all good''\\)\")",
+      "Bash(\"/c/Users/lipey/AppData/Local/Programs/Python/Python313/python.exe\" -m pytest tests/ -v --tb=short)",
+      "Bash(\"/c/Users/lipey/AppData/Local/Programs/Python/Python313/python.exe\" -m pytest tests/test_tracer1_unknown_capability_discovery.py -v --tb=short)",
+      "Bash(\"/c/Users/lipey/AppData/Local/Programs/Python/Python313/python.exe\" -m pytest tests/test_tracer2_civic_hard_block.py -v --tb=short)",
+      "Bash(\"/c/Users/lipey/AppData/Local/Programs/Python/Python313/python.exe\" -m pytest tests/test_tracer3_synthesis_chain.py -v --tb=short)",
+      "Bash(\"/c/Users/lipey/AppData/Local/Programs/Python/Python313/python.exe\" -m pytest tests/test_tracer4_redis_cache_reuse.py -v --tb=short)"
+    ]
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(\"/c/Users/lipey/AppData/Local/Programs/Python/Python313/python.exe\" -m pytest tests/test_c7_telemetry.py -v --tb=short)",
+      "Bash(\"/c/Users/lipey/AppData/Local/Programs/Python/Python313/python.exe\" demo.py)",
+      "Bash(\"/c/Users/lipey/AppData/Local/Programs/Python/Python313/python.exe\" -m pytest tests/ -v)"
+    ]
+  }
+}
