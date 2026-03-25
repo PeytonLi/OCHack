@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import logging
 import time
+from contextlib import asynccontextmanager
 from typing import Optional
 
 from fastapi import FastAPI
@@ -9,9 +11,45 @@ from skill_orchestrator.models import SkillRequest, SkillResponse
 from skill_orchestrator.router import CapabilityRouter
 from skill_orchestrator.telemetry import telemetry
 
-app = FastAPI(title="Skill Orchestrator")
+logger = logging.getLogger(__name__)
 
 _router: Optional[CapabilityRouter] = None
+
+
+def _auto_configure() -> None:
+    """Auto-configure from env-based adapters if set_adapters() hasn't been called."""
+    global _router
+    if _router is not None:
+        return
+    from skill_orchestrator.adapters.env_adapters import (
+        EnvCapabilityDetector,
+        EnvDocsCrawler,
+        EnvGroundingProvider,
+        EnvRuntimeSandbox,
+        EnvSkillCache,
+        EnvSkillRegistry,
+        EnvTrustVerifier,
+    )
+
+    logger.info("No adapters configured — auto-configuring from environment variables")
+    _router = CapabilityRouter(
+        capability_detector=EnvCapabilityDetector(),
+        skill_registry=EnvSkillRegistry(),
+        docs_crawler=EnvDocsCrawler(),
+        grounding_provider=EnvGroundingProvider(),
+        trust_verifier=EnvTrustVerifier(),
+        skill_cache=EnvSkillCache(),
+        runtime_sandbox=EnvRuntimeSandbox(),
+    )
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    _auto_configure()
+    yield
+
+
+app = FastAPI(title="Skill Orchestrator", lifespan=lifespan)
 
 
 def set_adapters(
@@ -41,6 +79,11 @@ def set_adapters(
     telemetry.blocks = 0
     telemetry.quarantines = 0
     telemetry.total_resolution_time = 0.0
+
+
+@app.get("/health")
+async def health() -> dict:
+    return {"status": "ok"}
 
 
 @app.post("/resolve-skill-and-run", response_model=SkillResponse)

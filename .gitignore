@@ -40,3 +40,7 @@ Thumbs.db
 
 # Logs
 *.log
+
+# AutoSkill service
+*.pid
+.service.log

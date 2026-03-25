@@ -1,0 +1,89 @@
+#!/usr/bin/env bash
+# SessionStart hook: ensures the AutoSkill service is running and injects context.
+set -euo pipefail
+
+PLUGIN_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+PORT="${AUTOSKILL_PORT:-8321}"
+PID_FILE="$PLUGIN_ROOT/.service.pid"
+HEALTH_URL="http://localhost:$PORT/health"
+
+# ── Locate Python ────────────────────────────────────────────────────────────
+find_python() {
+    for cmd in python3 python; do
+        if command -v "$cmd" >/dev/null 2>&1; then
+            echo "$cmd"
+            return
+        fi
+    done
+    # Common Windows locations
+    for p in \
+        "$LOCALAPPDATA/Programs/Python/Python313/python.exe" \
+        "$LOCALAPPDATA/Programs/Python/Python312/python.exe" \
+        "$LOCALAPPDATA/Programs/Python/Python311/python.exe" \
+        "$LOCALAPPDATA/Programs/Python/Python310/python.exe" \
+        "$LOCALAPPDATA/Programs/Python/Python39/python.exe"; do
+        if [ -x "$p" ] 2>/dev/null; then
+            echo "$p"
+            return
+        fi
+    done
+    return 1
+}
+
+# ── Check if service is already running ──────────────────────────────────────
+is_running() {
+    if [ -f "$PID_FILE" ]; then
+        local pid
+        pid=$(cat "$PID_FILE")
+        if kill -0 "$pid" 2>/dev/null; then
+            if curl -sf "$HEALTH_URL" >/dev/null 2>&1; then
+                return 0
+            fi
+        fi
+        # Stale PID file
+        rm -f "$PID_FILE"
+    fi
+    return 1
+}
+
+# ── Start service ────────────────────────────────────────────────────────────
+start_service() {
+    local py
+    py=$(find_python) || {
+        echo '{"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": "AutoSkill: Python not found. Install Python 3.9+ to enable AutoSkill."}}'
+        exit 0
+    }
+
+    # Ensure dependencies are installed
+    if ! "$py" -c "import fastapi" 2>/dev/null; then
+        "$py" -m pip install -q -r "$PLUGIN_ROOT/requirements.txt" 2>/dev/null || true
+    fi
+
+    # Start uvicorn in background
+    PYTHONPATH="$PLUGIN_ROOT/src" "$py" -m uvicorn skill_orchestrator.app:app \
+        --host 127.0.0.1 --port "$PORT" \
+        --log-level warning \
+        >"$PLUGIN_ROOT/.service.log" 2>&1 &
+    local pid=$!
+    echo "$pid" > "$PID_FILE"
+
+    # Wait for readiness (up to 5 seconds)
+    for i in $(seq 1 10); do
+        if curl -sf "$HEALTH_URL" >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 0.5
+    done
+
+    # Service didn't start in time
+    return 1
+}
+
+# ── Main ─────────────────────────────────────────────────────────────────────
+if is_running; then
+    echo '{"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": "AutoSkill is active on port '"$PORT"'. Use /auto-skill or call POST http://localhost:'"$PORT"'/resolve-skill-and-run to resolve capability gaps."}}'
+elif start_service; then
+    echo '{"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": "AutoSkill service started on port '"$PORT"'. Use /auto-skill or call POST http://localhost:'"$PORT"'/resolve-skill-and-run to resolve capability gaps."}}'
+else
+    echo '{"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": "AutoSkill: service failed to start. Run `bash scripts/start-service.sh start` manually to diagnose."}}'
+fi
