@@ -13,13 +13,17 @@ class FakeRedisClient:
         self.values = {}
         self.get_calls = 0
         self.set_calls = 0
+        self.get_keys = []
+        self.set_keys = []
 
     async def get(self, key):
         self.get_calls += 1
+        self.get_keys.append(key)
         return self.values.get(key)
 
     async def setex(self, key, ttl, value):
         self.set_calls += 1
+        self.set_keys.append(key)
         self.values[key] = value
 
     async def aclose(self):
@@ -43,6 +47,7 @@ def _settings() -> Settings:
 @pytest.mark.asyncio
 async def test_create_app_runs_real_adapter_synthesis_then_cache_hit():
     friendli_calls = []
+    clawhub_calls = []
     apify_calls = []
     contextual_calls = []
     civic_calls = []
@@ -78,6 +83,14 @@ async def test_create_app_runs_real_adapter_synthesis_then_cache_hit():
             json=[{"source": "apify", "content": "Docs for summarize-pdf"}],
         )
 
+    def clawhub_handler(request: Request) -> Response:
+        clawhub_calls.append((request.method, request.url.path))
+        if request.url.path == "/api/v1/skills/summarize-pdf":
+            return Response(404, json={"error": "not found"})
+        if request.url.path == "/api/v1/search":
+            return Response(200, json={"results": []})
+        raise AssertionError(f"Unexpected request: {request.method} {request.url}")
+
     def contextual_handler(request: Request) -> Response:
         contextual_calls.append(json.loads(request.content.decode()))
         if len(contextual_calls) == 1:
@@ -92,6 +105,7 @@ async def test_create_app_runs_real_adapter_synthesis_then_cache_hit():
         _settings(),
         transports={
             "friendli": MockTransport(friendli_handler),
+            "clawhub": MockTransport(clawhub_handler),
             "apify": MockTransport(apify_handler),
             "contextual": MockTransport(contextual_handler),
             "civic": MockTransport(civic_handler),
@@ -115,11 +129,19 @@ async def test_create_app_runs_real_adapter_synthesis_then_cache_hit():
     assert second["success"] is True
     assert second["resolution_strategy"] == ResolutionStrategy.LOCAL_CACHE.value
     assert len(friendli_calls) == 3
+    assert len(clawhub_calls) == 2
     assert len(apify_calls) == 1
     assert len(contextual_calls) == 2
     assert len(civic_calls) == 1
-    assert redis_client.get_calls == 2
-    assert redis_client.set_calls == 1
+    assert any(key.startswith("skill-resolution:") for key in redis_client.set_keys)
+    assert any(
+        key.startswith("clawhub-download:clawhub:detail:")
+        for key in redis_client.set_keys
+    )
+    assert any(
+        key.startswith("clawhub-download:clawhub:search:")
+        for key in redis_client.set_keys
+    )
 
 
 @pytest.mark.asyncio
@@ -156,6 +178,13 @@ async def test_create_app_real_adapters_respect_civic_hard_block():
             json=[{"source": "apify", "content": "Docs for run-network-scan"}],
         )
 
+    def clawhub_handler(request: Request) -> Response:
+        if request.url.path == "/api/v1/skills/run-network-scan":
+            return Response(404, json={"error": "not found"})
+        if request.url.path == "/api/v1/search":
+            return Response(200, json={"results": []})
+        raise AssertionError(f"Unexpected request: {request.method} {request.url}")
+
     contextual_call_count = {"count": 0}
 
     def contextual_handler(request: Request) -> Response:
@@ -171,6 +200,7 @@ async def test_create_app_real_adapters_respect_civic_hard_block():
         _settings(),
         transports={
             "friendli": MockTransport(friendli_handler),
+            "clawhub": MockTransport(clawhub_handler),
             "apify": MockTransport(apify_handler),
             "contextual": MockTransport(contextual_handler),
             "civic": MockTransport(civic_handler),
@@ -191,4 +221,11 @@ async def test_create_app_real_adapters_respect_civic_hard_block():
     data = response.json()
     assert data["success"] is False
     assert "trust" in data["error"].lower() or "blocked" in data["error"].lower()
-    assert redis_client.set_calls == 0
+    assert not any(
+        key.startswith("skill-resolution:")
+        for key in redis_client.set_keys
+    )
+    assert any(
+        key.startswith("clawhub-download:clawhub:detail:")
+        for key in redis_client.set_keys
+    )

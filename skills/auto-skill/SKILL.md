@@ -9,6 +9,7 @@ metadata:
     config:
       optionalEnv:
         - FRIENDLI_API_KEY
+        - CLAWHUB_BASE_URL
         - APIFY_API_TOKEN
         - CONTEXTUAL_API_KEY
         - CIVIC_API_KEY
@@ -93,7 +94,8 @@ AutoSkill works with zero configuration using in-memory fakes for development. F
 | Variable | Provider | Purpose |
 |----------|----------|---------|
 | `FRIENDLI_API_KEY` | Friendli | Capability gap detection, draft skill generation |
-| `APIFY_API_TOKEN` | Apify | ClawHub search, docs crawling |
+| `CLAWHUB_BASE_URL` | ClawHub | Direct registry search and raw `SKILL.md` retrieval |
+| `APIFY_API_TOKEN` | Apify | Optional legacy docs fallback |
 | `CONTEXTUAL_API_KEY` | Contextual AI | Grounded schema extraction, confidence scoring |
 | `CIVIC_API_KEY` | Civic | Trust verification (hard block authority) |
 | `REDIS_URL` | Redis | Cross-agent memory cache |

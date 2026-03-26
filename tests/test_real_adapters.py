@@ -6,8 +6,11 @@ import pytest
 from skill_orchestrator.adapters.production import (
     ApifyDocsCrawler,
     CivicTrustVerifier,
+    ClawHubDocsCrawler,
+    ClawHubSkillRegistry,
     ContextualGroundingProvider,
     FriendliCapabilityDetector,
+    RedisPayloadCache,
     RedisSkillCache,
 )
 from skill_orchestrator.exceptions import ProviderResponseError, TransientProviderError
@@ -126,6 +129,299 @@ async def test_civic_verifier_maps_boolean_trust_result():
         adapter = CivicTrustVerifier(client=client)
         assert await adapter.verify({"name": "safe-skill"}) is True
         assert await adapter.verify({"name": "unsafe-skill"}) is False
+
+
+@pytest.mark.asyncio
+async def test_clawhub_registry_uses_search_then_fetches_skill_markdown():
+    seen = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append((request.method, request.url.path, dict(request.url.params)))
+        if request.url.path == "/api/v1/skills/calendar-sync":
+            return httpx.Response(404, json={"error": "not found"})
+        if request.url.path == "/api/v1/search":
+            assert request.url.params["q"] == "calendar sync"
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {
+                            "slug": "calendar",
+                            "displayName": "Calendar",
+                            "summary": "Manage calendars and meetings.",
+                            "version": None,
+                            "score": 3.7,
+                        }
+                    ]
+                },
+            )
+        if request.url.path == "/api/v1/skills/calendar":
+            return httpx.Response(
+                200,
+                json={
+                    "skill": {
+                        "slug": "calendar",
+                        "displayName": "Calendar",
+                        "summary": "Manage calendars and meetings.",
+                        "tags": {"latest": "1.0.0"},
+                        "stats": {"downloads": 42},
+                    },
+                    "latestVersion": {"version": "1.0.0"},
+                    "metadata": {"os": ["linux"]},
+                    "owner": {"handle": "publisher"},
+                    "moderation": None,
+                },
+            )
+        if request.url.path == "/api/v1/skills/calendar/file":
+            assert request.url.params["path"] == "SKILL.md"
+            assert request.url.params["tag"] == "latest"
+            return httpx.Response(200, text="# Calendar\n\nDo calendar tasks.")
+        raise AssertionError(f"Unexpected request: {request.method} {request.url}")
+
+    async with httpx.AsyncClient(
+        base_url="https://clawhub.ai",
+        transport=httpx.MockTransport(handler),
+    ) as client:
+        adapter = ClawHubSkillRegistry(client=client)
+        skill = await adapter.search("calendar sync")
+
+    assert skill["source"] == "clawhub"
+    assert skill["slug"] == "calendar"
+    assert skill["name"] == "Calendar"
+    assert skill["version"] == "1.0.0"
+    assert skill["search_score"] == 3.7
+    assert "Do calendar tasks." in skill["skill_md"]
+    assert seen[0][1] == "/api/v1/skills/calendar-sync"
+    assert seen[1][1] == "/api/v1/search"
+    assert seen[2][1] == "/api/v1/skills/calendar"
+    assert seen[3][1] == "/api/v1/skills/calendar/file"
+
+
+@pytest.mark.asyncio
+async def test_clawhub_registry_reuses_redis_cached_search_and_skill_downloads():
+    seen = []
+    redis_client = FakeRedisClient()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append((request.method, request.url.path, dict(request.url.params)))
+        if request.url.path == "/api/v1/skills/calendar-sync":
+            return httpx.Response(404, json={"error": "not found"})
+        if request.url.path == "/api/v1/search":
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {
+                            "slug": "calendar",
+                            "displayName": "Calendar",
+                            "summary": "Manage calendars and meetings.",
+                            "version": None,
+                            "score": 3.7,
+                        }
+                    ]
+                },
+            )
+        if request.url.path == "/api/v1/skills/calendar":
+            return httpx.Response(
+                200,
+                json={
+                    "skill": {
+                        "slug": "calendar",
+                        "displayName": "Calendar",
+                        "summary": "Manage calendars and meetings.",
+                        "tags": {"latest": "1.0.0"},
+                        "stats": {"downloads": 42},
+                    },
+                    "latestVersion": {"version": "1.0.0"},
+                    "metadata": {"os": ["linux"]},
+                    "owner": {"handle": "publisher"},
+                    "moderation": None,
+                },
+            )
+        if request.url.path == "/api/v1/skills/calendar/file":
+            return httpx.Response(200, text="# Calendar\n\nDo calendar tasks.")
+        raise AssertionError(f"Unexpected request: {request.method} {request.url}")
+
+    async with httpx.AsyncClient(
+        base_url="https://clawhub.ai",
+        transport=httpx.MockTransport(handler),
+    ) as client:
+        adapter = ClawHubSkillRegistry(
+            client=client,
+            payload_cache=RedisPayloadCache(
+                redis_client,
+                namespace="clawhub-download",
+            ),
+        )
+        first = await adapter.search("calendar sync")
+        second = await adapter.search("calendar sync")
+
+    assert first == second
+    assert len(seen) == 4
+    assert seen[0][1] == "/api/v1/skills/calendar-sync"
+    assert seen[1][1] == "/api/v1/search"
+    assert seen[2][1] == "/api/v1/skills/calendar"
+    assert seen[3][1] == "/api/v1/skills/calendar/file"
+
+
+@pytest.mark.asyncio
+async def test_clawhub_registry_rejects_low_score_non_exact_matches():
+    seen = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url.path)
+        if request.url.path == "/api/v1/skills/definitely-not-a-real-skill-xyz123":
+            return httpx.Response(404, json={"error": "not found"})
+        if request.url.path == "/api/v1/search":
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {
+                            "slug": "skillscanner",
+                            "displayName": "Skillscanner",
+                            "summary": "Scan skills.",
+                            "version": None,
+                            "score": 1.0,
+                        }
+                    ]
+                },
+            )
+        raise AssertionError(f"Unexpected request: {request.method} {request.url}")
+
+    async with httpx.AsyncClient(
+        base_url="https://clawhub.ai",
+        transport=httpx.MockTransport(handler),
+    ) as client:
+        adapter = ClawHubSkillRegistry(client=client, min_search_score=1.2)
+        skill = await adapter.search("definitely-not-a-real-skill-xyz123")
+
+    assert skill is None
+    assert seen == [
+        "/api/v1/skills/definitely-not-a-real-skill-xyz123",
+        "/api/v1/search",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_clawhub_docs_crawler_fetches_skill_markdown_for_top_results():
+    seen = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append((request.url.path, dict(request.url.params)))
+        if request.url.path == "/api/v1/search":
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {
+                            "slug": "calendar",
+                            "displayName": "Calendar",
+                            "summary": "Manage calendars and meetings.",
+                            "version": None,
+                            "score": 3.7,
+                        },
+                        {
+                            "slug": "noise-skill",
+                            "displayName": "Noise Skill",
+                            "summary": "Ignore this one.",
+                            "version": None,
+                            "score": 0.9,
+                        },
+                    ]
+                },
+            )
+        if request.url.path == "/api/v1/skills/calendar":
+            return httpx.Response(
+                200,
+                json={
+                    "skill": {
+                        "slug": "calendar",
+                        "displayName": "Calendar",
+                        "summary": "Manage calendars and meetings.",
+                    },
+                    "latestVersion": {"version": "1.0.0"},
+                },
+            )
+        if request.url.path == "/api/v1/skills/calendar/file":
+            return httpx.Response(200, text="# Calendar\n\nUse this skill.")
+        raise AssertionError(f"Unexpected request: {request.method} {request.url}")
+
+    async with httpx.AsyncClient(
+        base_url="https://clawhub.ai",
+        transport=httpx.MockTransport(handler),
+    ) as client:
+        adapter = ClawHubDocsCrawler(client=client, docs_limit=2, min_search_score=1.2)
+        docs = await adapter.crawl_docs("calendar")
+
+    assert len(docs) == 1
+    assert docs[0]["slug"] == "calendar"
+    assert "Summary: Manage calendars and meetings." in docs[0]["content"]
+    assert "Use this skill." in docs[0]["content"]
+    assert seen[0][0] == "/api/v1/search"
+    assert seen[1][0] == "/api/v1/skills/calendar"
+    assert seen[2][0] == "/api/v1/skills/calendar/file"
+
+
+@pytest.mark.asyncio
+async def test_clawhub_docs_crawler_reuses_redis_cached_skill_downloads():
+    seen = []
+    redis_client = FakeRedisClient()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append((request.url.path, dict(request.url.params)))
+        if request.url.path == "/api/v1/search":
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {
+                            "slug": "calendar",
+                            "displayName": "Calendar",
+                            "summary": "Manage calendars and meetings.",
+                            "version": None,
+                            "score": 3.7,
+                        }
+                    ]
+                },
+            )
+        if request.url.path == "/api/v1/skills/calendar":
+            return httpx.Response(
+                200,
+                json={
+                    "skill": {
+                        "slug": "calendar",
+                        "displayName": "Calendar",
+                        "summary": "Manage calendars and meetings.",
+                    },
+                    "latestVersion": {"version": "1.0.0"},
+                },
+            )
+        if request.url.path == "/api/v1/skills/calendar/file":
+            return httpx.Response(200, text="# Calendar\n\nUse this skill.")
+        raise AssertionError(f"Unexpected request: {request.method} {request.url}")
+
+    async with httpx.AsyncClient(
+        base_url="https://clawhub.ai",
+        transport=httpx.MockTransport(handler),
+    ) as client:
+        adapter = ClawHubDocsCrawler(
+            client=client,
+            docs_limit=2,
+            min_search_score=1.2,
+            payload_cache=RedisPayloadCache(
+                redis_client,
+                namespace="clawhub-download",
+            ),
+        )
+        first = await adapter.crawl_docs("calendar")
+        second = await adapter.crawl_docs("calendar")
+
+    assert first == second
+    assert len(seen) == 3
+    assert seen[0][0] == "/api/v1/search"
+    assert seen[1][0] == "/api/v1/skills/calendar"
+    assert seen[2][0] == "/api/v1/skills/calendar/file"
 
 
 @pytest.mark.asyncio

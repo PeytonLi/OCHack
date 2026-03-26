@@ -4,14 +4,16 @@ import pytest
 from skill_orchestrator.adapters.production import (
     ApifyDocsCrawler,
     CivicTrustVerifier,
+    ClawHubDocsCrawler,
+    ClawHubSkillRegistry,
     ContextualGroundingProvider,
+    FallbackDocsCrawler,
     FriendliCapabilityDetector,
     InMemorySkillCache,
-    LocalDocsCrawler,
     LocalGroundingProvider,
     PermissiveTrustVerifier,
     PrototypeCapabilityDetector,
-    NullSkillRegistry,
+    RedisPayloadCache,
     RedisSkillCache,
 )
 from skill_orchestrator.app import create_app
@@ -43,6 +45,14 @@ def test_load_settings_applies_defaults():
     )
 
     assert settings.friendli_base_url == "https://api.friendli.ai/serverless/v1"
+    assert settings.clawhub_base_url == "https://clawhub.ai"
+    assert settings.clawhub_search_limit == 5
+    assert settings.clawhub_docs_limit == 3
+    assert settings.clawhub_min_search_score == 1.2
+    assert settings.clawhub_non_suspicious_only is True
+    assert settings.clawhub_skill_file_path == "SKILL.md"
+    assert settings.clawhub_tag == "latest"
+    assert settings.clawhub_cache_ttl_seconds == 3600
     assert settings.apify_base_url == "https://api.apify.com/v2"
     assert settings.enable_apify is False
     assert settings.enable_contextual is False
@@ -141,6 +151,9 @@ def test_create_app_wires_production_adapters():
             "friendli": httpx.MockTransport(
                 lambda request: httpx.Response(200, json={"choices": []})
             ),
+            "clawhub": httpx.MockTransport(
+                lambda request: httpx.Response(200, json={"results": []})
+            ),
             "apify": httpx.MockTransport(
                 lambda request: httpx.Response(200, json={"data": []})
             ),
@@ -156,21 +169,33 @@ def test_create_app_wires_production_adapters():
 
     router = app.state.router
     assert isinstance(router.detector, FriendliCapabilityDetector)
-    assert isinstance(router.registry, NullSkillRegistry)
-    assert isinstance(router.docs_crawler, ApifyDocsCrawler)
+    assert isinstance(router.registry, ClawHubSkillRegistry)
+    assert isinstance(router.docs_crawler, FallbackDocsCrawler)
+    assert isinstance(router.docs_crawler.crawlers[0], ClawHubDocsCrawler)
+    assert isinstance(router.docs_crawler.crawlers[1], ApifyDocsCrawler)
+    assert isinstance(router.registry.payload_cache, RedisPayloadCache)
+    assert isinstance(router.docs_crawler.crawlers[0].payload_cache, RedisPayloadCache)
     assert isinstance(router.grounding, ContextualGroundingProvider)
     assert isinstance(router.trust, CivicTrustVerifier)
     assert isinstance(router.cache, RedisSkillCache)
 
 
-def test_create_app_defaults_to_local_fallbacks_for_disabled_providers():
+def test_create_app_uses_clawhub_defaults_when_optional_providers_disabled():
     settings = load_settings({"FRIENDLI_API_KEY": "friendli-key"})
-    app = create_app(settings)
+    app = create_app(
+        settings,
+        transports={
+            "clawhub": httpx.MockTransport(
+                lambda request: httpx.Response(200, json={"results": []})
+            )
+        },
+    )
 
     router = app.state.router
     assert isinstance(router.detector, PrototypeCapabilityDetector)
-    assert isinstance(router.registry, NullSkillRegistry)
-    assert isinstance(router.docs_crawler, LocalDocsCrawler)
+    assert isinstance(router.registry, ClawHubSkillRegistry)
+    assert isinstance(router.docs_crawler, FallbackDocsCrawler)
+    assert isinstance(router.docs_crawler.crawlers[0], ClawHubDocsCrawler)
     assert isinstance(router.grounding, LocalGroundingProvider)
     assert isinstance(router.trust, PermissiveTrustVerifier)
     assert isinstance(router.cache, InMemorySkillCache)

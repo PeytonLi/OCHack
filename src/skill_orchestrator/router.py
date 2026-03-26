@@ -87,10 +87,12 @@ class CapabilityRouter:
         try:
             registry_hit = await _retry_once(self.registry.search, capability)
         except TRANSIENT_ERRORS as exc:
-            return SkillResponse(
-                success=False, capability=capability,
-                error=f"Transient error during registry search after retry: {exc}",
+            logger.warning(
+                "registry search unavailable after retry for %s; continuing to synthesis: %s",
+                capability,
+                exc,
             )
+            registry_hit = None
         if registry_hit is not None:
             try:
                 trusted = await _retry_once(self.trust.verify, registry_hit)

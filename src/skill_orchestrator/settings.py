@@ -12,6 +12,7 @@ DEFAULT_FRIENDLI_BASE_URL = "https://api.friendli.ai/serverless/v1"
 DEFAULT_CONTEXTUAL_BASE_URL = "https://api.contextual.ai/v1"
 DEFAULT_CIVIC_BASE_URL = "https://api.civic.example/v1"
 DEFAULT_APIFY_BASE_URL = "https://api.apify.com/v2"
+DEFAULT_CLAWHUB_BASE_URL = "https://clawhub.ai"
 
 
 @dataclass(frozen=True)
@@ -31,6 +32,14 @@ class Settings:
     contextual_model: str = "contextual-grounded"
     civic_base_url: str = DEFAULT_CIVIC_BASE_URL
     civic_verify_path: str = "/trust/verify"
+    clawhub_base_url: str = DEFAULT_CLAWHUB_BASE_URL
+    clawhub_search_limit: int = 5
+    clawhub_docs_limit: int = 3
+    clawhub_min_search_score: float = 1.2
+    clawhub_non_suspicious_only: bool = True
+    clawhub_skill_file_path: str = "SKILL.md"
+    clawhub_tag: str = "latest"
+    clawhub_cache_ttl_seconds: int = 3600
     apify_base_url: str = DEFAULT_APIFY_BASE_URL
     apify_docs_actor_id: str = "docs-crawler"
     apify_wait_for_finish_seconds: int = 60
@@ -96,6 +105,20 @@ def load_settings(env: Optional[Mapping[str, str]] = None) -> Settings:
         contextual_model=source.get("CONTEXTUAL_MODEL", "contextual-grounded"),
         civic_base_url=source.get("CIVIC_BASE_URL", DEFAULT_CIVIC_BASE_URL),
         civic_verify_path=source.get("CIVIC_VERIFY_PATH", "/trust/verify"),
+        clawhub_base_url=source.get("CLAWHUB_BASE_URL", DEFAULT_CLAWHUB_BASE_URL),
+        clawhub_search_limit=_read_int(source, "CLAWHUB_SEARCH_LIMIT", 5),
+        clawhub_docs_limit=_read_int(source, "CLAWHUB_DOCS_LIMIT", 3),
+        clawhub_min_search_score=_read_float(
+            source, "CLAWHUB_MIN_SEARCH_SCORE", 1.2
+        ),
+        clawhub_non_suspicious_only=_read_bool(
+            source, "CLAWHUB_NON_SUSPICIOUS_ONLY", True
+        ),
+        clawhub_skill_file_path=source.get("CLAWHUB_SKILL_FILE_PATH", "SKILL.md"),
+        clawhub_tag=source.get("CLAWHUB_TAG", "latest"),
+        clawhub_cache_ttl_seconds=_read_int(
+            source, "CLAWHUB_CACHE_TTL_SECONDS", 3600
+        ),
         apify_base_url=source.get("APIFY_BASE_URL", DEFAULT_APIFY_BASE_URL),
         apify_docs_actor_id=source.get("APIFY_DOCS_ACTOR_ID", "docs-crawler"),
         apify_wait_for_finish_seconds=_read_int(

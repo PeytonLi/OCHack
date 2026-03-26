@@ -1,15 +1,23 @@
 from __future__ import annotations
 
 import json
+import logging
+import re
 from typing import Any, Dict, Iterable, List, Optional
 
 import httpx
 
 from skill_orchestrator.exceptions import (
+    ProviderError,
     ProviderAuthError,
     ProviderResponseError,
     TransientProviderError,
 )
+
+_NON_ALNUM_RE = re.compile(r"[^a-z0-9]+")
+_CACHE_MISS = object()
+
+logger = logging.getLogger(__name__)
 
 
 class RedisSkillCache:
@@ -57,6 +65,49 @@ class RedisSkillCache:
         return f"skill-resolution:{capability}"
 
 
+class RedisPayloadCache:
+    """Best-effort Redis cache for provider payloads."""
+
+    def __init__(self, redis_client, *, namespace: str = "provider-payload"):
+        self.redis = redis_client
+        self.namespace = namespace
+
+    async def get(self, key: str) -> Any:
+        try:
+            raw = await self.redis.get(self._key(key))
+        except Exception as exc:  # pragma: no cover - backend-specific errors
+            logger.warning("Redis payload cache get failed for %s: %s", key, exc)
+            return _CACHE_MISS
+
+        if raw is None:
+            return _CACHE_MISS
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8")
+        if isinstance(raw, dict) and "value" in raw:
+            return raw["value"]
+
+        try:
+            decoded = json.loads(raw)
+        except (TypeError, ValueError):
+            return _CACHE_MISS
+        if not isinstance(decoded, dict) or "value" not in decoded:
+            return _CACHE_MISS
+        return decoded["value"]
+
+    async def set(self, key: str, value: Any, ttl: int = 3600) -> None:
+        payload = json.dumps({"value": value})
+        try:
+            if hasattr(self.redis, "setex"):
+                await self.redis.setex(self._key(key), ttl, payload)
+            else:
+                await self.redis.set(self._key(key), payload, ex=ttl)
+        except Exception as exc:  # pragma: no cover - backend-specific errors
+            logger.warning("Redis payload cache set failed for %s: %s", key, exc)
+
+    def _key(self, key: str) -> str:
+        return f"{self.namespace}:{key}"
+
+
 class InMemorySkillCache:
     def __init__(self):
         self.store: Dict[str, Dict[str, Any]] = {}
@@ -83,6 +134,25 @@ class LocalDocsCrawler:
                 "content": f"No external documentation crawler configured for capability: {capability}",
             }
         ]
+
+
+class FallbackDocsCrawler:
+    def __init__(self, *crawlers):
+        self.crawlers = tuple(crawler for crawler in crawlers if crawler is not None)
+
+    async def crawl_docs(self, capability: str) -> List[Dict[str, Any]]:
+        last_error: Optional[Exception] = None
+        for crawler in self.crawlers:
+            try:
+                docs = await crawler.crawl_docs(capability)
+            except (ProviderError, ConnectionError, TimeoutError, OSError) as exc:
+                last_error = exc
+                continue
+            if docs:
+                return docs
+        if last_error is not None:
+            raise last_error
+        return []
 
 
 class LocalGroundingProvider:
@@ -140,7 +210,9 @@ class HttpJsonAdapter:
     async def aclose(self) -> None:
         await self.client.aclose()
 
-    async def _request_json(self, method: str, path: str, **kwargs) -> Any:
+    async def _request(
+        self, method: str, path: str, *, allow_not_found: bool = False, **kwargs
+    ) -> Optional[httpx.Response]:
         try:
             response = await self.client.request(method, path, **kwargs)
         except httpx.TimeoutException as exc:
@@ -152,6 +224,8 @@ class HttpJsonAdapter:
                 f"{self.provider_name} request failed: {exc}"
             ) from exc
 
+        if allow_not_found and response.status_code == 404:
+            return None
         if response.status_code in {408, 429} or response.status_code >= 500:
             raise TransientProviderError(
                 f"{self.provider_name} transient error {response.status_code}: "
@@ -168,6 +242,12 @@ class HttpJsonAdapter:
                 f"{_truncate(response.text)}"
             )
 
+        return response
+
+    async def _request_json(self, method: str, path: str, **kwargs) -> Any:
+        response = await self._request(method, path, **kwargs)
+        if response is None:
+            return None
         try:
             return response.json()
         except ValueError as exc:
@@ -175,12 +255,422 @@ class HttpJsonAdapter:
                 f"{self.provider_name} returned invalid JSON"
             ) from exc
 
+    async def _request_text(self, method: str, path: str, **kwargs) -> Optional[str]:
+        response = await self._request(method, path, **kwargs)
+        if response is None:
+            return None
+        return response.text
+
     async def _post_json(self, path: str, payload: Dict[str, Any], **kwargs) -> Any:
         return await self._request_json("POST", path, json=payload, **kwargs)
 
     def _extract_llm_json(self, payload: Dict[str, Any]) -> Any:
         text = _extract_text(payload)
         return _parse_json_text(text)
+
+
+class ClawHubSkillRegistry(HttpJsonAdapter):
+    def __init__(
+        self,
+        client: httpx.AsyncClient,
+        *,
+        search_limit: int = 5,
+        min_search_score: float = 1.2,
+        non_suspicious_only: bool = True,
+        file_path: str = "SKILL.md",
+        tag: str = "latest",
+        payload_cache: Optional[RedisPayloadCache] = None,
+        cache_ttl: int = 3600,
+    ):
+        super().__init__(client, "ClawHub")
+        self.search_limit = search_limit
+        self.min_search_score = min_search_score
+        self.non_suspicious_only = non_suspicious_only
+        self.file_path = file_path
+        self.tag = tag
+        self.payload_cache = payload_cache
+        self.cache_ttl = cache_ttl
+
+    async def search(self, capability: str) -> Optional[Dict[str, Any]]:
+        exact = await self._fetch_exact_match(capability)
+        if exact is not None:
+            return exact
+
+        results = await self._search_results(capability, limit=self.search_limit)
+        if not results:
+            return None
+
+        match = self._select_best_match(capability, results)
+        if match is None:
+            return None
+
+        slug = match.get("slug")
+        if not isinstance(slug, str) or not slug:
+            return None
+        return await self._fetch_skill(slug, search_result=match)
+
+    async def _fetch_exact_match(self, capability: str) -> Optional[Dict[str, Any]]:
+        for slug in _slug_candidates(capability):
+            skill = await self._fetch_skill(
+                slug,
+                search_result={
+                    "slug": slug,
+                    "displayName": capability,
+                    "summary": None,
+                    "version": None,
+                    "score": None,
+                },
+                allow_not_found=True,
+            )
+            if skill is not None:
+                return skill
+        return None
+
+    async def _search_results(
+        self, capability: str, *, limit: int
+    ) -> List[Dict[str, Any]]:
+        cached = await self._cache_get(
+            "search",
+            capability=capability,
+            limit=limit,
+            non_suspicious_only=self.non_suspicious_only,
+        )
+        if isinstance(cached, list):
+            return [item for item in cached if isinstance(item, dict)]
+
+        params: Dict[str, Any] = {"q": capability, "limit": limit}
+        if self.non_suspicious_only:
+            params["nonSuspiciousOnly"] = True
+        payload = await self._request_json("GET", "/api/v1/search", params=params)
+        if isinstance(payload, dict):
+            results = payload.get("results", payload.get("items"))
+        elif isinstance(payload, list):
+            results = payload
+        else:
+            results = None
+        if results is None:
+            await self._cache_set(
+                "search",
+                [],
+                capability=capability,
+                limit=limit,
+                non_suspicious_only=self.non_suspicious_only,
+            )
+            return []
+        if not isinstance(results, list):
+            raise ProviderResponseError("ClawHub search response was not a list")
+        filtered = [item for item in results if isinstance(item, dict)]
+        await self._cache_set(
+            "search",
+            filtered,
+            capability=capability,
+            limit=limit,
+            non_suspicious_only=self.non_suspicious_only,
+        )
+        return filtered
+
+    async def _fetch_skill(
+        self,
+        slug: str,
+        *,
+        search_result: Optional[Dict[str, Any]] = None,
+        allow_not_found: bool = False,
+    ) -> Optional[Dict[str, Any]]:
+        detail = await self._fetch_skill_detail(
+            slug,
+            allow_not_found=allow_not_found,
+        )
+        if detail is None:
+            return None
+        skill_md = await self._fetch_skill_file(slug)
+        return _build_clawhub_skill(
+            detail,
+            search_result=search_result,
+            skill_md=skill_md,
+        )
+
+    async def _fetch_skill_detail(
+        self, slug: str, *, allow_not_found: bool = False
+    ) -> Optional[Dict[str, Any]]:
+        cached = await self._cache_get(
+            "detail",
+            slug=slug,
+            allow_not_found=allow_not_found,
+        )
+        if cached is None:
+            return None
+        if isinstance(cached, dict):
+            return cached
+
+        detail = await self._request_json(
+            "GET",
+            f"/api/v1/skills/{slug}",
+            allow_not_found=allow_not_found,
+        )
+        if detail is not None and not isinstance(detail, dict):
+            raise ProviderResponseError("ClawHub skill detail response was not an object")
+        await self._cache_set(
+            "detail",
+            detail,
+            slug=slug,
+            allow_not_found=allow_not_found,
+        )
+        return detail
+
+    async def _fetch_skill_file(self, slug: str) -> Optional[str]:
+        cached = await self._cache_get(
+            "file",
+            slug=slug,
+            path=self.file_path,
+            tag=self.tag or "",
+        )
+        if cached is None:
+            return None
+        if isinstance(cached, str):
+            return cached
+
+        file_params: Dict[str, Any] = {"path": self.file_path}
+        if self.tag:
+            file_params["tag"] = self.tag
+        skill_md = await self._request_text(
+            "GET",
+            f"/api/v1/skills/{slug}/file",
+            params=file_params,
+            allow_not_found=True,
+        )
+        await self._cache_set(
+            "file",
+            skill_md,
+            slug=slug,
+            path=self.file_path,
+            tag=self.tag or "",
+        )
+        return skill_md
+
+    async def _cache_get(self, kind: str, **parts: Any) -> Any:
+        if self.payload_cache is None:
+            return _CACHE_MISS
+        return await self.payload_cache.get(_cache_key(kind, **parts))
+
+    async def _cache_set(self, kind: str, value: Any, **parts: Any) -> None:
+        if self.payload_cache is None:
+            return
+        await self.payload_cache.set(
+            _cache_key(kind, **parts),
+            value,
+            ttl=self.cache_ttl,
+        )
+
+    def _select_best_match(
+        self, capability: str, results: List[Dict[str, Any]]
+    ) -> Optional[Dict[str, Any]]:
+        normalized_query = _normalize_skill_key(capability)
+        for result in results:
+            slug = _normalize_skill_key(result.get("slug"))
+            display_name = _normalize_skill_key(result.get("displayName"))
+            if normalized_query and normalized_query in {slug, display_name}:
+                return result
+
+        top_result = results[0]
+        score = _as_float(top_result.get("score"))
+        if score is None or score < self.min_search_score:
+            return None
+        return top_result
+
+
+class ClawHubDocsCrawler(HttpJsonAdapter):
+    def __init__(
+        self,
+        client: httpx.AsyncClient,
+        *,
+        search_limit: int = 5,
+        docs_limit: int = 3,
+        min_search_score: float = 1.2,
+        non_suspicious_only: bool = True,
+        file_path: str = "SKILL.md",
+        tag: str = "latest",
+        payload_cache: Optional[RedisPayloadCache] = None,
+        cache_ttl: int = 3600,
+    ):
+        super().__init__(client, "ClawHub")
+        self.search_limit = search_limit
+        self.docs_limit = docs_limit
+        self.min_search_score = min_search_score
+        self.non_suspicious_only = non_suspicious_only
+        self.file_path = file_path
+        self.tag = tag
+        self.payload_cache = payload_cache
+        self.cache_ttl = cache_ttl
+
+    async def crawl_docs(self, capability: str) -> List[Dict[str, Any]]:
+        cached_results = await self._cache_get(
+            "search",
+            capability=capability,
+            limit=self.search_limit,
+            non_suspicious_only=self.non_suspicious_only,
+        )
+        if isinstance(cached_results, list):
+            results = [item for item in cached_results if isinstance(item, dict)]
+        else:
+            params: Dict[str, Any] = {"q": capability, "limit": self.search_limit}
+            if self.non_suspicious_only:
+                params["nonSuspiciousOnly"] = True
+            payload = await self._request_json("GET", "/api/v1/search", params=params)
+            if isinstance(payload, dict):
+                results = payload.get("results", payload.get("items"))
+            elif isinstance(payload, list):
+                results = payload
+            else:
+                results = None
+            if isinstance(results, list):
+                results = [item for item in results if isinstance(item, dict)]
+            else:
+                results = []
+            await self._cache_set(
+                "search",
+                results,
+                capability=capability,
+                limit=self.search_limit,
+                non_suspicious_only=self.non_suspicious_only,
+            )
+        if not isinstance(results, list):
+            return []
+
+        docs: List[Dict[str, Any]] = []
+        normalized_query = _normalize_skill_key(capability)
+        for result in results:
+            if not isinstance(result, dict):
+                continue
+            slug = result.get("slug")
+            if not isinstance(slug, str) or not slug:
+                continue
+            score = _as_float(result.get("score"))
+            slug_match = _normalize_skill_key(slug) == normalized_query
+            display_match = (
+                _normalize_skill_key(result.get("displayName")) == normalized_query
+            )
+            if not (
+                slug_match
+                or display_match
+                or (score is not None and score >= self.min_search_score)
+            ):
+                continue
+
+            detail = await self._fetch_skill_detail(slug, allow_not_found=True)
+            if not isinstance(detail, dict):
+                continue
+
+            skill_md = await self._fetch_skill_file(slug)
+
+            skill = detail.get("skill", {})
+            latest_version = detail.get("latestVersion", {})
+            summary = None
+            if isinstance(skill, dict):
+                summary = skill.get("summary")
+
+            content_parts = []
+            if isinstance(summary, str) and summary:
+                content_parts.append(f"Summary: {summary}")
+            if isinstance(skill_md, str) and skill_md.strip():
+                content_parts.append(skill_md)
+            if not content_parts:
+                continue
+
+            docs.append(
+                {
+                    "source": "clawhub",
+                    "slug": slug,
+                    "display_name": _coalesce(
+                        skill.get("displayName") if isinstance(skill, dict) else None,
+                        result.get("displayName"),
+                        slug,
+                    ),
+                    "summary": summary or result.get("summary"),
+                    "version": (
+                        latest_version.get("version")
+                        if isinstance(latest_version, dict)
+                        else result.get("version")
+                    ),
+                    "search_score": score,
+                    "content": "\n\n".join(content_parts),
+                }
+            )
+            if len(docs) >= self.docs_limit:
+                break
+
+        return docs
+
+    async def _fetch_skill_detail(
+        self, slug: str, *, allow_not_found: bool = False
+    ) -> Optional[Dict[str, Any]]:
+        cached = await self._cache_get(
+            "detail",
+            slug=slug,
+            allow_not_found=allow_not_found,
+        )
+        if cached is None:
+            return None
+        if isinstance(cached, dict):
+            return cached
+
+        detail = await self._request_json(
+            "GET",
+            f"/api/v1/skills/{slug}",
+            allow_not_found=allow_not_found,
+        )
+        if detail is not None and not isinstance(detail, dict):
+            raise ProviderResponseError("ClawHub skill detail response was not an object")
+        await self._cache_set(
+            "detail",
+            detail,
+            slug=slug,
+            allow_not_found=allow_not_found,
+        )
+        return detail
+
+    async def _fetch_skill_file(self, slug: str) -> Optional[str]:
+        cached = await self._cache_get(
+            "file",
+            slug=slug,
+            path=self.file_path,
+            tag=self.tag or "",
+        )
+        if cached is None:
+            return None
+        if isinstance(cached, str):
+            return cached
+
+        file_params: Dict[str, Any] = {"path": self.file_path}
+        if self.tag:
+            file_params["tag"] = self.tag
+        skill_md = await self._request_text(
+            "GET",
+            f"/api/v1/skills/{slug}/file",
+            params=file_params,
+            allow_not_found=True,
+        )
+        await self._cache_set(
+            "file",
+            skill_md,
+            slug=slug,
+            path=self.file_path,
+            tag=self.tag or "",
+        )
+        return skill_md
+
+    async def _cache_get(self, kind: str, **parts: Any) -> Any:
+        if self.payload_cache is None:
+            return _CACHE_MISS
+        return await self.payload_cache.get(_cache_key(kind, **parts))
+
+    async def _cache_set(self, kind: str, value: Any, **parts: Any) -> None:
+        if self.payload_cache is None:
+            return
+        await self.payload_cache.set(
+            _cache_key(kind, **parts),
+            value,
+            ttl=self.cache_ttl,
+        )
 
 
 class ApifyDocsCrawler(HttpJsonAdapter):
@@ -452,6 +942,102 @@ def _dedupe(values: Iterable[str]) -> List[str]:
             seen.add(value)
             deduped.append(value)
     return deduped
+
+
+def _cache_key(kind: str, **parts: Any) -> str:
+    suffix = ":".join(
+        f"{name}={json.dumps(parts[name], ensure_ascii=True, sort_keys=True)}"
+        for name in sorted(parts)
+    )
+    return f"clawhub:{kind}:{suffix}" if suffix else f"clawhub:{kind}"
+
+
+def _normalize_skill_key(value: Any) -> str:
+    if not isinstance(value, str):
+        return ""
+    normalized = value.strip().lower()
+    if "/" in normalized:
+        normalized = normalized.rsplit("/", 1)[-1]
+    return _NON_ALNUM_RE.sub("-", normalized).strip("-")
+
+
+def _slug_candidates(capability: str) -> List[str]:
+    raw = capability.strip()
+    candidates = [raw]
+    if "/" in raw:
+        candidates.insert(0, raw.rsplit("/", 1)[-1])
+
+    normalized: List[str] = []
+    seen = set()
+    for candidate in candidates:
+        slug = _normalize_skill_key(candidate)
+        if slug and slug not in seen:
+            normalized.append(slug)
+            seen.add(slug)
+    return normalized
+
+
+def _coalesce(*values: Any) -> Any:
+    for value in values:
+        if value is not None:
+            return value
+    return None
+
+
+def _as_float(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _build_clawhub_skill(
+    detail: Dict[str, Any],
+    *,
+    search_result: Optional[Dict[str, Any]],
+    skill_md: Optional[str],
+) -> Dict[str, Any]:
+    search_result = search_result or {}
+    skill = detail.get("skill", {})
+    latest_version = detail.get("latestVersion", {})
+    metadata = detail.get("metadata", {})
+    owner = detail.get("owner", {})
+
+    slug = _coalesce(
+        skill.get("slug") if isinstance(skill, dict) else None,
+        search_result.get("slug"),
+    )
+    display_name = _coalesce(
+        skill.get("displayName") if isinstance(skill, dict) else None,
+        search_result.get("displayName"),
+        slug,
+    )
+    return {
+        "source": "clawhub",
+        "slug": slug,
+        "name": display_name,
+        "display_name": display_name,
+        "summary": _coalesce(
+            skill.get("summary") if isinstance(skill, dict) else None,
+            search_result.get("summary"),
+        ),
+        "version": _coalesce(
+            latest_version.get("version")
+            if isinstance(latest_version, dict)
+            else None,
+            search_result.get("version"),
+        ),
+        "search_score": search_result.get("score"),
+        "skill_md": skill_md,
+        "tags": skill.get("tags") if isinstance(skill, dict) else {},
+        "stats": skill.get("stats") if isinstance(skill, dict) else {},
+        "metadata": metadata if isinstance(metadata, dict) else {},
+        "owner": owner if isinstance(owner, dict) else {},
+        "moderation": detail.get("moderation"),
+        "latest_version": latest_version if isinstance(latest_version, dict) else {},
+    }
 
 
 def _truncate(value: str, limit: int = 200) -> str:

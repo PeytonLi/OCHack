@@ -1,7 +1,10 @@
 from skill_orchestrator.adapters.production import (
     ApifyDocsCrawler,
     CivicTrustVerifier,
+    ClawHubDocsCrawler,
+    ClawHubSkillRegistry,
     ContextualGroundingProvider,
+    FallbackDocsCrawler,
     FriendliCapabilityDetector,
     InMemorySkillCache,
     LocalDocsCrawler,
@@ -15,7 +18,10 @@ from skill_orchestrator.adapters.production import (
 __all__ = [
     "ApifyDocsCrawler",
     "CivicTrustVerifier",
+    "ClawHubDocsCrawler",
+    "ClawHubSkillRegistry",
     "ContextualGroundingProvider",
+    "FallbackDocsCrawler",
     "FriendliCapabilityDetector",
     "InMemorySkillCache",
     "LocalDocsCrawler",

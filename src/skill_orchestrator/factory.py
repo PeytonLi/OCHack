@@ -8,14 +8,17 @@ import httpx
 from skill_orchestrator.adapters.production import (
     ApifyDocsCrawler,
     CivicTrustVerifier,
+    ClawHubDocsCrawler,
+    ClawHubSkillRegistry,
     ContextualGroundingProvider,
+    FallbackDocsCrawler,
     FriendliCapabilityDetector,
     InMemorySkillCache,
     LocalDocsCrawler,
     LocalGroundingProvider,
-    NullSkillRegistry,
     PermissiveTrustVerifier,
     PrototypeCapabilityDetector,
+    RedisPayloadCache,
     RedisSkillCache,
 )
 from skill_orchestrator.router import CapabilityRouter
@@ -25,7 +28,7 @@ from skill_orchestrator.settings import Settings
 @dataclass
 class ProductionResources:
     capability_detector: Any
-    skill_registry: NullSkillRegistry
+    skill_registry: Any
     docs_crawler: Any
     grounding_provider: Any
     trust_verifier: Any
@@ -69,6 +72,12 @@ def build_production_resources(
         settings.http_timeout_seconds,
         transports.get("friendli"),
     )
+    clawhub_client = _build_http_client(
+        settings.clawhub_base_url,
+        {},
+        settings.http_timeout_seconds,
+        transports.get("clawhub"),
+    )
 
     apify_client = None
     if settings.enable_apify:
@@ -102,19 +111,52 @@ def build_production_resources(
 
         redis_client = from_url(settings.redis_url, decode_responses=True)
 
-    docs_crawler = (
-        ApifyDocsCrawler(
-            client=apify_client,
-            actor_id=settings.apify_docs_actor_id,
-            wait_for_finish_seconds=settings.apify_wait_for_finish_seconds,
-            intended_usage_template=settings.apify_intended_usage_template,
-            improvement_suggestions=settings.apify_improvement_suggestions,
-            contact=settings.apify_contact,
-            max_items=settings.apify_max_items,
-            download_content=settings.apify_download_content,
+    clawhub_payload_cache = (
+        RedisPayloadCache(redis_client, namespace="clawhub-download")
+        if settings.enable_redis and redis_client is not None
+        else None
+    )
+
+    clawhub_docs = ClawHubDocsCrawler(
+        client=clawhub_client,
+        search_limit=max(settings.clawhub_search_limit, settings.clawhub_docs_limit),
+        docs_limit=settings.clawhub_docs_limit,
+        min_search_score=settings.clawhub_min_search_score,
+        non_suspicious_only=settings.clawhub_non_suspicious_only,
+        file_path=settings.clawhub_skill_file_path,
+        tag=settings.clawhub_tag,
+        payload_cache=clawhub_payload_cache,
+        cache_ttl=settings.clawhub_cache_ttl_seconds,
+    )
+    if settings.enable_apify and apify_client is not None:
+        docs_crawler = FallbackDocsCrawler(
+            clawhub_docs,
+            ApifyDocsCrawler(
+                client=apify_client,
+                actor_id=settings.apify_docs_actor_id,
+                wait_for_finish_seconds=settings.apify_wait_for_finish_seconds,
+                intended_usage_template=settings.apify_intended_usage_template,
+                improvement_suggestions=settings.apify_improvement_suggestions,
+                contact=settings.apify_contact,
+                max_items=settings.apify_max_items,
+                download_content=settings.apify_download_content,
+            ),
+            LocalDocsCrawler(),
         )
-        if settings.enable_apify and apify_client is not None
-        else LocalDocsCrawler()
+    else:
+        docs_crawler = FallbackDocsCrawler(
+            clawhub_docs,
+            LocalDocsCrawler(),
+        )
+    skill_registry = ClawHubSkillRegistry(
+        client=clawhub_client,
+        search_limit=settings.clawhub_search_limit,
+        min_search_score=settings.clawhub_min_search_score,
+        non_suspicious_only=settings.clawhub_non_suspicious_only,
+        file_path=settings.clawhub_skill_file_path,
+        tag=settings.clawhub_tag,
+        payload_cache=clawhub_payload_cache,
+        cache_ttl=settings.clawhub_cache_ttl_seconds,
     )
     grounding_provider = (
         ContextualGroundingProvider(
@@ -138,7 +180,7 @@ def build_production_resources(
         else InMemorySkillCache()
     )
 
-    closeables = [friendli_client]
+    closeables = [friendli_client, clawhub_client]
     for resource in (apify_client, contextual_client, civic_client):
         if resource is not None:
             closeables.append(resource)
@@ -164,7 +206,7 @@ def build_production_resources(
 
     resources = ProductionResources(
         capability_detector=capability_detector,
-        skill_registry=NullSkillRegistry(),
+        skill_registry=skill_registry,
         docs_crawler=docs_crawler,
         grounding_provider=grounding_provider,
         trust_verifier=trust_verifier,

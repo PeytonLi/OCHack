@@ -1,6 +1,6 @@
 # AutoSkill
 
-AutoSkill is a ClawHub/Claude skill backed by the `skill_orchestrator` service in `src/`. It detects capability gaps, searches for reusable skills, synthesizes new ones when needed, verifies trust and safety, and caches successful resolutions for reuse across agents.
+AutoSkill is a ClawHub/Claude skill backed by the `skill_orchestrator` service in `src/`. It detects capability gaps, searches for reusable skills, synthesizes new ones when needed, verifies trust and safety, and caches both successful resolutions and ClawHub skill downloads for reuse across agents.
 
 ## Quick Start
 
@@ -18,6 +18,8 @@ If you want real provider integrations, copy `.env.example` to `.env` and fill i
 
 ```bash
 pip install -r requirements.txt
+bash scripts/setup-redis.sh
+bash scripts/start-redis.sh start
 python -m pytest tests/ -v
 python demo.py
 bash scripts/start-service.sh start
@@ -33,12 +35,14 @@ PYTHONPATH=src uvicorn skill_orchestrator.app:app --host 127.0.0.1 --port 8321
 
 ## Configuration
 
-Set `FRIENDLI_API_KEY` to enable production bootstrap. Additional providers are opt-in through `ENABLE_APIFY`, `ENABLE_CONTEXTUAL`, `ENABLE_CIVIC`, and `ENABLE_REDIS`; when a provider is disabled, the service falls back to local implementations where possible.
+Set `FRIENDLI_API_KEY` to enable production bootstrap. ClawHub registry search and `SKILL.md` retrieval use the public registry directly, and when Redis is enabled those search/detail/file payloads are cached in Redis as well. Additional providers are opt-in through `ENABLE_APIFY`, `ENABLE_CONTEXTUAL`, `ENABLE_CIVIC`, and `ENABLE_REDIS`; when a provider is disabled, the service falls back to local implementations where possible.
 
 | Variable | Provider | Purpose |
 |----------|----------|---------|
 | `FRIENDLI_API_KEY` | Friendli | Capability gap detection, draft skill generation |
-| `APIFY_API_TOKEN` | Apify | ClawHub search support, documentation crawling |
+| `CLAWHUB_BASE_URL` | ClawHub | Registry search and raw `SKILL.md` retrieval (defaults to `https://clawhub.ai`) |
+| `CLAWHUB_CACHE_TTL_SECONDS` | ClawHub + Redis | TTL for cached ClawHub search/detail/file payloads |
+| `APIFY_API_TOKEN` | Apify | Optional legacy docs fallback |
 | `CONTEXTUAL_API_KEY` | Contextual AI | Grounded schema extraction, confidence scoring |
 | `CIVIC_API_KEY` | Civic | Trust verification, policy authority |
 | `REDIS_URL` | Redis | Cross-agent memory cache |
@@ -83,7 +87,7 @@ POST /resolve-skill-and-run
          │     └─ found → TrustVerifier (Civic) gate → sandbox → return
          │
          └─ 4. SynthesisPipeline (no retrieval match)
-               ├─ DocsCrawler (Apify) - crawl documentation
+               ├─ DocsCrawler (ClawHub `SKILL.md`, optional Apify fallback)
                ├─ GroundingProvider (Contextual AI) - extract schema + score
                ├─ CapabilityDetector (Friendli) - generate draft
                ├─ Confidence threshold check (stricter for high-risk)
@@ -106,4 +110,4 @@ GET /metrics → telemetry counters
 5. Partial success: capability-gap report with completed step results when resolution fails
 6. High-risk thresholds: shell, network, filesystem, and exec skills require confidence >= 0.9
 7. License allowlist: only MIT, Apache-2.0, BSD, ISC, Unlicense, and CC0 permitted
-8. Global cache: Redis provides cross-agent memory reuse
+8. Global cache: Redis provides cross-agent memory reuse and caches ClawHub skill downloads
