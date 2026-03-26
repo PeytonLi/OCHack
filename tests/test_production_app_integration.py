@@ -4,7 +4,8 @@ import pytest
 from httpx import ASGITransport, AsyncClient, MockTransport, Request, Response
 
 from skill_orchestrator.app import create_app
-from skill_orchestrator.models import PublishState, ResolutionStrategy
+from skill_orchestrator.adapters import production
+from skill_orchestrator.models import ResolutionStrategy
 from skill_orchestrator.settings import Settings
 
 
@@ -13,12 +14,10 @@ class FakeRedisClient:
         self.values = {}
         self.get_calls = 0
         self.set_calls = 0
-        self.get_keys = []
         self.set_keys = []
 
     async def get(self, key):
         self.get_calls += 1
-        self.get_keys.append(key)
         return self.values.get(key)
 
     async def setex(self, key, ttl, value):
@@ -34,23 +33,35 @@ def _settings() -> Settings:
     return Settings(
         friendli_api_key="friendli-key",
         apify_api_token="apify-key",
-        contextual_api_key="contextual-key",
-        civic_api_key="civic-key",
         redis_url="redis://localhost:6379",
         enable_apify=True,
-        enable_contextual=True,
-        enable_civic=True,
         enable_redis=True,
+        sandbox_root=".autoskill-tests",
+    )
+
+
+def _draft_payload(name: str, output: str) -> str:
+    return json.dumps(
+        {
+            "draft": {
+                "name": name,
+                "description": f"Run {name}",
+                "skill_md": f"# {name}\n\nRun {name}.",
+                "files": {
+                    "SKILL.md": f"# {name}\n\nRun {name}.",
+                    "hooks/run-hook.cmd": f'@echo {{"output":"{output}"}}',
+                },
+                "dependencies": [],
+            }
+        }
     )
 
 
 @pytest.mark.asyncio
-async def test_create_app_runs_real_adapter_synthesis_then_cache_hit():
+async def test_create_app_runs_synthesis_then_cache_hit(monkeypatch):
     friendli_calls = []
     clawhub_calls = []
     apify_calls = []
-    contextual_calls = []
-    civic_calls = []
     redis_client = FakeRedisClient()
 
     def friendli_handler(request: Request) -> Response:
@@ -62,25 +73,7 @@ async def test_create_app_runs_real_adapter_synthesis_then_cache_hit():
             )
         return Response(
             200,
-            json={
-                "choices": [
-                    {
-                        "message": {
-                            "content": (
-                                '{"draft": {"name": "summarize-pdf", "code": "pass", '
-                                '"version": "0.1.0", "dependencies": []}}'
-                            )
-                        }
-                    }
-                ]
-            },
-        )
-
-    def apify_handler(request: Request) -> Response:
-        apify_calls.append((request.method, request.url.path))
-        return Response(
-            200,
-            json=[{"source": "apify", "content": "Docs for summarize-pdf"}],
+            json={"choices": [{"message": {"content": _draft_payload("summarize-pdf", "ok")}}]},
         )
 
     def clawhub_handler(request: Request) -> Response:
@@ -91,15 +84,14 @@ async def test_create_app_runs_real_adapter_synthesis_then_cache_hit():
             return Response(200, json={"results": []})
         raise AssertionError(f"Unexpected request: {request.method} {request.url}")
 
-    def contextual_handler(request: Request) -> Response:
-        contextual_calls.append(json.loads(request.content.decode()))
-        if len(contextual_calls) == 1:
-            return Response(200, json={"response": '{"fields": ["title"]}'})
-        return Response(200, json={"response": '{"confidence": 0.95}'})
+    def apify_handler(request: Request) -> Response:
+        apify_calls.append((request.method, request.url.path))
+        return Response(200, json=[{"source": "apify", "content": "Docs for summarize-pdf"}])
 
-    def civic_handler(request: Request) -> Response:
-        civic_calls.append(json.loads(request.content.decode()))
-        return Response(200, json={"trusted": True})
+    async def fake_run_subprocess(command, **kwargs):
+        return ('{"output":"ok"}', "")
+
+    monkeypatch.setattr(production, "_run_subprocess", fake_run_subprocess)
 
     app = create_app(
         _settings(),
@@ -107,8 +99,6 @@ async def test_create_app_runs_real_adapter_synthesis_then_cache_hit():
             "friendli": MockTransport(friendli_handler),
             "clawhub": MockTransport(clawhub_handler),
             "apify": MockTransport(apify_handler),
-            "contextual": MockTransport(contextual_handler),
-            "civic": MockTransport(civic_handler),
         },
         redis_client=redis_client,
     )
@@ -125,14 +115,14 @@ async def test_create_app_runs_real_adapter_synthesis_then_cache_hit():
 
     assert first["success"] is True
     assert first["resolution_strategy"] == ResolutionStrategy.SYNTHESIS.value
-    assert first["publish_state"] == PublishState.ACTIVE.value
+    assert first["publish_state"] is None
+    assert first["result"] == {"output": "ok"}
     assert second["success"] is True
     assert second["resolution_strategy"] == ResolutionStrategy.LOCAL_CACHE.value
+    assert second["result"] == {"output": "ok"}
     assert len(friendli_calls) == 3
     assert len(clawhub_calls) == 2
     assert len(apify_calls) == 1
-    assert len(contextual_calls) == 2
-    assert len(civic_calls) == 1
     assert any(key.startswith("skill-resolution:") for key in redis_client.set_keys)
     assert any(
         key.startswith("clawhub-download:clawhub:detail:")
@@ -145,87 +135,37 @@ async def test_create_app_runs_real_adapter_synthesis_then_cache_hit():
 
 
 @pytest.mark.asyncio
-async def test_create_app_real_adapters_respect_civic_hard_block():
-    redis_client = FakeRedisClient()
-
+async def test_create_app_returns_native_capability_when_friendli_says_known(monkeypatch):
     def friendli_handler(request: Request) -> Response:
-        body = json.loads(request.content.decode())
-        messages = body.get("messages", [])
-        if "Determine whether" in messages[0]["content"]:
-            return Response(
-                200,
-                json={"choices": [{"message": {"content": '{"unknown": true}'}}]},
-            )
         return Response(
             200,
-            json={
-                "choices": [
-                    {
-                        "message": {
-                            "content": (
-                                '{"draft": {"name": "run-network-scan", "code": "pass", '
-                                '"version": "0.1.0", "dependencies": []}}'
-                            )
-                        }
-                    }
-                ]
-            },
+            json={"choices": [{"message": {"content": '{"unknown": false}'}}]},
         )
 
-    def apify_handler(request: Request) -> Response:
-        return Response(
-            200,
-            json=[{"source": "apify", "content": "Docs for run-network-scan"}],
-        )
+    async def fake_run_subprocess(command, **kwargs):
+        return ("", "")
 
-    def clawhub_handler(request: Request) -> Response:
-        if request.url.path == "/api/v1/skills/run-network-scan":
-            return Response(404, json={"error": "not found"})
-        if request.url.path == "/api/v1/search":
-            return Response(200, json={"results": []})
-        raise AssertionError(f"Unexpected request: {request.method} {request.url}")
-
-    contextual_call_count = {"count": 0}
-
-    def contextual_handler(request: Request) -> Response:
-        contextual_call_count["count"] += 1
-        if contextual_call_count["count"] == 1:
-            return Response(200, json={"response": '{"fields": ["host"]}'})
-        return Response(200, json={"response": '{"confidence": 0.95}'})
-
-    def civic_handler(request: Request) -> Response:
-        return Response(200, json={"trusted": False})
+    monkeypatch.setattr(production, "_run_subprocess", fake_run_subprocess)
 
     app = create_app(
-        _settings(),
+        Settings(friendli_api_key="friendli-key", sandbox_root=".autoskill-tests"),
         transports={
             "friendli": MockTransport(friendli_handler),
-            "clawhub": MockTransport(clawhub_handler),
-            "apify": MockTransport(apify_handler),
-            "contextual": MockTransport(contextual_handler),
-            "civic": MockTransport(civic_handler),
+            "clawhub": MockTransport(lambda request: Response(200, json={"results": []})),
         },
-        redis_client=redis_client,
     )
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         response = await client.post(
             "/resolve-skill-and-run",
             json={
-                "capability": "run-network-scan",
+                "capability": "native-shell",
                 "input_data": {},
                 "agent_id": "agent-2",
             },
         )
 
     data = response.json()
-    assert data["success"] is False
-    assert "trust" in data["error"].lower() or "blocked" in data["error"].lower()
-    assert not any(
-        key.startswith("skill-resolution:")
-        for key in redis_client.set_keys
-    )
-    assert any(
-        key.startswith("clawhub-download:clawhub:detail:")
-        for key in redis_client.set_keys
-    )
+    assert data["success"] is True
+    assert data["resolution_strategy"] == ResolutionStrategy.NATIVE_CAPABILITY.value
+    assert data["result"]["status"] == ResolutionStrategy.NATIVE_CAPABILITY.value

@@ -1,25 +1,22 @@
-"""C2: Active vs quarantined publish transitions with smoke tests.
-
-Behavior under test:
-  - If policy passes AND smoke test passes → publish as ACTIVE.
-  - If policy passes BUT smoke test fails → publish as QUARANTINED.
-  Smoke test is the sandbox healthcheck on synthesized skills.
-"""
+"""C2: Mainline synthesis no longer publishes or quarantines."""
 import pytest
 from httpx import ASGITransport, AsyncClient
 
 from skill_orchestrator.app import app, set_adapters
-from skill_orchestrator.models import PublishState, ResolutionStrategy
+from skill_orchestrator.models import ResolutionStrategy
 
-
-# ---------- Fakes ----------
 
 class FakeCapabilityDetector:
     async def detect_gap(self, capability: str) -> bool:
         return True
 
     async def generate_draft(self, capability, context):
-        return {"name": capability, "code": "pass", "version": "0.1.0"}
+        return {
+            "name": capability,
+            "description": f"Run {capability}",
+            "skill_md": f"# {capability}",
+            "files": {"SKILL.md": f"# {capability}"},
+        }
 
 
 class EmptySkillRegistry:
@@ -29,20 +26,7 @@ class EmptySkillRegistry:
 
 class FakeDocsCrawler:
     async def crawl_docs(self, capability: str):
-        return [{"source": "apify", "content": "docs"}]
-
-
-class FakeGroundingProvider:
-    async def extract_schema(self, raw_docs):
-        return {"schema": "ok"}
-
-    async def confidence_score(self, skill):
-        return 0.9
-
-
-class ApprovingTrustVerifier:
-    async def verify(self, skill) -> bool:
-        return True
+        return [{"source": "clawhub", "content": "docs"}]
 
 
 class FakeSkillCache:
@@ -54,12 +38,11 @@ class FakeSkillCache:
 
 
 class SmokeFailSandbox:
-    """Install succeeds, healthcheck (smoke test) fails."""
     async def install(self, skill):
         return True
 
     async def healthcheck(self, skill):
-        return False  # smoke test fails
+        return False
 
     async def execute(self, skill, input_data):
         raise RuntimeError("should not execute")
@@ -69,7 +52,6 @@ class SmokeFailSandbox:
 
 
 class SmokePassSandbox:
-    """Everything works fine."""
     async def install(self, skill):
         return True
 
@@ -83,60 +65,51 @@ class SmokePassSandbox:
         pass
 
 
-# ---------- Tests ----------
-
 @pytest.mark.asyncio
-async def test_smoke_pass_publishes_as_active():
-    """Civic passes + smoke passes → ACTIVE."""
+async def test_smoke_pass_executes_without_publish_state():
     set_adapters(
         capability_detector=FakeCapabilityDetector(),
         skill_registry=EmptySkillRegistry(),
         docs_crawler=FakeDocsCrawler(),
-        grounding_provider=FakeGroundingProvider(),
-        trust_verifier=ApprovingTrustVerifier(),
+        grounding_provider=None,
+        trust_verifier=None,
         skill_cache=FakeSkillCache(),
         runtime_sandbox=SmokePassSandbox(),
     )
 
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
-        response = await client.post("/resolve-skill-and-run", json={
-            "capability": "good-skill",
-            "input_data": {},
-            "agent_id": "a1",
-        })
+        response = await client.post(
+            "/resolve-skill-and-run",
+            json={"capability": "good-skill", "input_data": {}, "agent_id": "a1"},
+        )
 
     data = response.json()
     assert data["success"] is True
-    assert data["publish_state"] == PublishState.ACTIVE.value
+    assert data["publish_state"] is None
     assert data["resolution_strategy"] == ResolutionStrategy.SYNTHESIS.value
 
 
 @pytest.mark.asyncio
-async def test_smoke_fail_publishes_as_quarantined():
-    """Civic passes + smoke fails → QUARANTINED (not a hard failure)."""
+async def test_smoke_fail_returns_runtime_error():
     set_adapters(
         capability_detector=FakeCapabilityDetector(),
         skill_registry=EmptySkillRegistry(),
         docs_crawler=FakeDocsCrawler(),
-        grounding_provider=FakeGroundingProvider(),
-        trust_verifier=ApprovingTrustVerifier(),
+        grounding_provider=None,
+        trust_verifier=None,
         skill_cache=FakeSkillCache(),
         runtime_sandbox=SmokeFailSandbox(),
     )
 
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
-        response = await client.post("/resolve-skill-and-run", json={
-            "capability": "flaky-skill",
-            "input_data": {},
-            "agent_id": "a1",
-        })
+        response = await client.post(
+            "/resolve-skill-and-run",
+            json={"capability": "flaky-skill", "input_data": {}, "agent_id": "a1"},
+        )
 
     data = response.json()
-
-    # Should NOT be a hard failure — skill is published but quarantined
-    assert data["success"] is True, \
-        f"Smoke-fail should be partial success (quarantined), got error: {data.get('error')}"
-    assert data["publish_state"] == PublishState.QUARANTINED.value
-    assert data["resolution_strategy"] == ResolutionStrategy.SYNTHESIS.value
+    assert data["success"] is False
+    assert data["publish_state"] is None
+    assert "healthcheck" in data.get("error", "").lower()

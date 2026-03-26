@@ -13,6 +13,7 @@ class SkillRequest(BaseModel):
 
 
 class ResolutionStrategy(str, Enum):
+    NATIVE_CAPABILITY = "native_capability"
     LOCAL_CACHE = "local_cache"
     CLAWHUB_RETRIEVAL = "clawhub_retrieval"
     SYNTHESIS = "synthesis"

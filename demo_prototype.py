@@ -19,8 +19,17 @@ from skill_orchestrator.settings import load_settings
 
 SCENARIOS = [
     {
-        "title": "1. Prototype Synthesis",
-        "desc": "Friendli-backed draft generation with local fallback docs/trust/cache unless enabled in .env",
+        "title": "1. Native Capability Check",
+        "desc": "Friendli can return native_capability when no external resolution is needed",
+        "payload": {
+            "capability": "native-capability",
+            "input_data": {},
+            "agent_id": "prototype-demo",
+        },
+    },
+    {
+        "title": "2. Retrieval Or Synthesis",
+        "desc": "Unknown capabilities first try ClawHub, then synthesize a runnable draft",
         "payload": {
             "capability": "summarize-pdf",
             "input_data": {"url": "doc.pdf"},
@@ -28,8 +37,8 @@ SCENARIOS = [
         },
     },
     {
-        "title": "2. Cache Reuse",
-        "desc": "Second request for the same capability should resolve from cache",
+        "title": "3. Cache Reuse",
+        "desc": "Second request for the same capability should reuse the cached executed result",
         "payload": {
             "capability": "summarize-pdf",
             "input_data": {"url": "doc.pdf"},
@@ -43,10 +52,11 @@ def _settings_summary(settings) -> dict:
     return {
         "friendli_base_url": settings.friendli_base_url,
         "friendli_model": settings.friendli_model,
+        "clawhub_base_url": settings.clawhub_base_url,
+        "clawhub_bin": settings.clawhub_bin,
         "enable_apify": settings.enable_apify,
-        "enable_contextual": settings.enable_contextual,
-        "enable_civic": settings.enable_civic,
         "enable_redis": settings.enable_redis,
+        "sandbox_root": settings.sandbox_root,
     }
 
 
@@ -65,9 +75,9 @@ async def main() -> None:
             {
                 "capability_detector": type(router.detector).__name__,
                 "docs_crawler": type(router.docs_crawler).__name__,
-                "grounding_provider": type(router.grounding).__name__,
-                "trust_verifier": type(router.trust).__name__,
+                "skill_registry": type(router.registry).__name__,
                 "skill_cache": type(router.cache).__name__,
+                "runtime_sandbox": type(router.sandbox).__name__,
             },
             indent=2,
         )

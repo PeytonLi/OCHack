@@ -1,9 +1,17 @@
 from __future__ import annotations
 
+import asyncio
+import inspect
 import json
 import logging
+import os
+from pathlib import Path
 import re
+import shutil
+import sys
+import tempfile
 from typing import Any, Dict, Iterable, List, Optional
+from uuid import uuid4
 
 import httpx
 
@@ -11,6 +19,8 @@ from skill_orchestrator.exceptions import (
     ProviderError,
     ProviderAuthError,
     ProviderResponseError,
+    RuntimeCommandError,
+    RuntimeSandboxError,
     TransientProviderError,
 )
 
@@ -58,11 +68,13 @@ class RedisSkillCache:
     async def aclose(self) -> None:
         closer = getattr(self.redis, "aclose", None)
         if callable(closer):
-            await closer()
+            maybe_result = closer()
+            if inspect.isawaitable(maybe_result):
+                await maybe_result
 
     @staticmethod
     def _key(capability: str) -> str:
-        return f"skill-resolution:{capability}"
+        return f"skill-resolution:{_normalize_skill_key(capability)}"
 
 
 class RedisPayloadCache:
@@ -83,8 +95,10 @@ class RedisPayloadCache:
             return _CACHE_MISS
         if isinstance(raw, bytes):
             raw = raw.decode("utf-8")
-        if isinstance(raw, dict) and "value" in raw:
-            return raw["value"]
+        if isinstance(raw, dict):
+            if "value" in raw:
+                return raw["value"]
+            return _CACHE_MISS
 
         try:
             decoded = json.loads(raw)
@@ -113,12 +127,12 @@ class InMemorySkillCache:
         self.store: Dict[str, Dict[str, Any]] = {}
 
     async def get(self, capability: str) -> Optional[Dict[str, Any]]:
-        return self.store.get(capability)
+        return self.store.get(_normalize_skill_key(capability))
 
     async def set(
         self, capability: str, resolution: Dict[str, Any], ttl: int = 300
     ) -> None:
-        self.store[capability] = resolution
+        self.store[_normalize_skill_key(capability)] = resolution
 
 
 class NullSkillRegistry:
@@ -134,6 +148,196 @@ class LocalDocsCrawler:
                 "content": f"No external documentation crawler configured for capability: {capability}",
             }
         ]
+
+
+class ClawHubCliSandbox:
+    def __init__(
+        self,
+        *,
+        clawhub_bin: str = "clawhub",
+        sandbox_root: str,
+        execution_timeout_seconds: float = 30.0,
+        command_runner=None,
+        which=None,
+    ):
+        self.clawhub_bin = clawhub_bin
+        self.sandbox_root = Path(sandbox_root)
+        self.execution_timeout_seconds = execution_timeout_seconds
+        self._command_runner = command_runner or _run_subprocess
+        self._which = which or shutil.which
+        self._resolved_cli = self._resolve_cli_command()
+
+    def validate_configuration(self) -> None:
+        if self._resolved_cli is None:
+            raise RuntimeSandboxError(
+                f"Unable to locate ClawHub CLI binary: {self.clawhub_bin}"
+            )
+
+    async def install(self, skill: Dict[str, Any]) -> bool:
+        slug = self._slug_for_skill(skill)
+        session_root = self.sandbox_root / uuid4().hex
+        skills_root = session_root / "skills"
+        skills_root.mkdir(parents=True, exist_ok=True)
+        skill_dir = skills_root / slug
+
+        runtime = {
+            "session_root": str(session_root),
+            "skills_root": str(skills_root),
+            "skill_dir": str(skill_dir),
+            "slug": slug,
+        }
+        skill["_autoskill_runtime"] = runtime
+
+        if skill.get("source") == "clawhub":
+            await self._install_registry_skill(skill, session_root)
+        else:
+            await self._materialize_local_skill(skill, skill_dir)
+        return True
+
+    async def healthcheck(self, skill: Dict[str, Any]) -> bool:
+        runtime = self._runtime(skill)
+        skill_dir = Path(runtime["skill_dir"])
+        skill_md = skill_dir / "SKILL.md"
+        if not skill_md.exists():
+            return False
+        return self._find_entrypoint(skill_dir) is not None
+
+    async def execute(self, skill: Dict[str, Any], input_data: Dict[str, Any]) -> Any:
+        runtime = self._runtime(skill)
+        skill_dir = Path(runtime["skill_dir"])
+        command = self._entrypoint_command(skill, skill_dir)
+        stdout, stderr = await self._command_runner(
+            command,
+            cwd=skill_dir,
+            input_text=json.dumps(input_data),
+            env={
+                "AUTOSKILL_INPUT": json.dumps(input_data),
+                "AUTOSKILL_CAPABILITY": skill.get("name", runtime["slug"]),
+            },
+            timeout_seconds=self.execution_timeout_seconds,
+        )
+        if stderr:
+            logger.info("skill runtime stderr for %s: %s", runtime["slug"], stderr)
+        parsed = _maybe_parse_json(stdout)
+        if parsed is not None:
+            return parsed
+        return {"stdout": stdout, "stderr": stderr}
+
+    async def rollback(self, skill: Dict[str, Any]) -> None:
+        runtime = skill.get("_autoskill_runtime")
+        if not isinstance(runtime, dict):
+            return
+        session_root = Path(runtime.get("session_root", ""))
+        if session_root:
+            shutil.rmtree(session_root, ignore_errors=True)
+        skill.pop("_autoskill_runtime", None)
+
+    async def _install_registry_skill(
+        self, skill: Dict[str, Any], session_root: Path
+    ) -> None:
+        slug = self._slug_for_skill(skill)
+        command = list(self._resolved_cli or [])
+        command.extend(
+            [
+                "--workdir",
+                str(session_root),
+                "--dir",
+                "skills",
+                "install",
+                "--force",
+                slug,
+            ]
+        )
+        version = skill.get("version")
+        if isinstance(version, str) and version:
+            command.extend(["--version", version])
+        await self._command_runner(
+            command,
+            cwd=session_root,
+            timeout_seconds=self.execution_timeout_seconds,
+        )
+
+    async def _materialize_local_skill(self, skill: Dict[str, Any], skill_dir: Path) -> None:
+        skill_dir.mkdir(parents=True, exist_ok=True)
+        files = dict(skill.get("files") or {})
+        if "SKILL.md" not in files:
+            files["SKILL.md"] = skill.get("skill_md", "")
+        for relative_path, content in files.items():
+            if not isinstance(relative_path, str) or not isinstance(content, str):
+                continue
+            file_path = skill_dir / relative_path
+            self._ensure_within(skill_dir, file_path)
+            file_path.parent.mkdir(parents=True, exist_ok=True)
+            file_path.write_text(content, encoding="utf-8")
+
+    def _runtime(self, skill: Dict[str, Any]) -> Dict[str, str]:
+        runtime = skill.get("_autoskill_runtime")
+        if not isinstance(runtime, dict):
+            raise RuntimeSandboxError("Skill is not installed in the runtime sandbox")
+        return runtime
+
+    def _entrypoint_command(self, skill: Dict[str, Any], skill_dir: Path) -> List[str]:
+        entrypoint = self._find_entrypoint(skill_dir)
+        if entrypoint is not None:
+            return _script_command(entrypoint)
+
+        command = skill.get("command")
+        if isinstance(command, list) and command and all(
+            isinstance(part, str) for part in command
+        ):
+            return [str(part) for part in command]
+        if isinstance(command, str) and command.strip():
+            return [command]
+        raise RuntimeSandboxError(
+            f"No runnable entrypoint found for skill {_normalize_skill_key(skill.get('name'))}"
+        )
+
+    def _find_entrypoint(self, skill_dir: Path) -> Optional[Path]:
+        candidates = [
+            skill_dir / "hooks" / "run-hook",
+            skill_dir / "hooks" / "run-hook.sh",
+            skill_dir / "hooks" / "run-hook.cmd",
+            skill_dir / "hooks" / "run-hook.ps1",
+        ]
+        for candidate in candidates:
+            if candidate.exists():
+                return candidate
+        return None
+
+    def _resolve_cli_command(self) -> Optional[List[str]]:
+        candidate = self.clawhub_bin.strip()
+        if not candidate:
+            return None
+        if os.name == "nt":
+            windows_candidate = self._which(candidate)
+            if windows_candidate:
+                suffix = Path(windows_candidate).suffix.lower()
+                if suffix == ".cmd":
+                    return ["cmd.exe", "/c", windows_candidate]
+                if suffix == ".ps1":
+                    return None
+                return [windows_candidate]
+            cmd_candidate = self._which(f"{candidate}.cmd")
+            if cmd_candidate:
+                return ["cmd.exe", "/c", cmd_candidate]
+            return None
+
+        resolved = self._which(candidate)
+        if resolved:
+            return [resolved]
+        return None
+
+    def _slug_for_skill(self, skill: Dict[str, Any]) -> str:
+        return _normalize_skill_key(
+            skill.get("slug") or skill.get("name") or skill.get("display_name")
+        ) or "generated-skill"
+
+    @staticmethod
+    def _ensure_within(root: Path, target: Path) -> None:
+        resolved_root = root.resolve()
+        resolved_target = target.resolve()
+        if os.path.commonpath([resolved_root, resolved_target]) != str(resolved_root):
+            raise RuntimeSandboxError(f"Refusing to write outside sandbox: {target}")
 
 
 class FallbackDocsCrawler:
@@ -754,8 +958,10 @@ class FriendliCapabilityDetector(HttpJsonAdapter):
     ) -> Optional[Dict[str, Any]]:
         payload = await self._chat_json(
             (
-                "Return JSON only. Produce a draft skill definition using the "
-                'provided capability and context. Respond with {"draft": <object|null>}.'
+                "Return JSON only. Produce a runnable draft skill package using the "
+                "provided capability and context. The draft object must include "
+                '"name", "description", and either "skill_md" or a files map '
+                'containing "SKILL.md". Respond with {"draft": <object|null>}.'
             ),
             json.dumps({"capability": capability, "context": context}),
         )
@@ -1045,3 +1251,80 @@ def _truncate(value: str, limit: int = 200) -> str:
     if len(value) <= limit:
         return value
     return value[: limit - 3] + "..."
+
+
+async def _run_subprocess(
+    command: List[str],
+    *,
+    cwd: Path,
+    input_text: Optional[str] = None,
+    env: Optional[Dict[str, str]] = None,
+    timeout_seconds: float = 30.0,
+) -> tuple[str, str]:
+    process_env = os.environ.copy()
+    if env:
+        process_env.update(env)
+
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *command,
+            cwd=str(cwd),
+            env=process_env,
+            stdin=asyncio.subprocess.PIPE if input_text is not None else None,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeCommandError(f"Command not found: {command[0]}") from exc
+
+    try:
+        stdout, stderr = await asyncio.wait_for(
+            process.communicate(
+                input_text.encode("utf-8") if input_text is not None else None
+            ),
+            timeout=timeout_seconds,
+        )
+    except asyncio.TimeoutError as exc:
+        process.kill()
+        await process.communicate()
+        raise RuntimeCommandError(
+            f"Command timed out after {timeout_seconds:.1f}s: {' '.join(command)}"
+        ) from exc
+
+    stdout_text = stdout.decode("utf-8", errors="replace").strip()
+    stderr_text = stderr.decode("utf-8", errors="replace").strip()
+    if process.returncode != 0:
+        message = stderr_text or stdout_text or f"exit code {process.returncode}"
+        raise RuntimeCommandError(
+            f"Command failed ({process.returncode}): {' '.join(command)}: {message}"
+        )
+    return stdout_text, stderr_text
+
+
+def _script_command(path: Path) -> List[str]:
+    suffix = path.suffix.lower()
+    if suffix == ".cmd":
+        return ["cmd.exe", "/c", str(path)]
+    if suffix == ".ps1":
+        return [
+            "powershell.exe",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(path),
+        ]
+    if suffix == ".sh":
+        return ["sh", str(path)]
+    if suffix == "" and os.name == "nt":
+        return ["cmd.exe", "/c", str(path)]
+    return [str(path)]
+
+
+def _maybe_parse_json(value: str) -> Any:
+    if not value:
+        return None
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError:
+        return None

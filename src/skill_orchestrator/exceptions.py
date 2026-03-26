@@ -23,3 +23,11 @@ class ProviderAuthError(ProviderError):
 
 class ProviderResponseError(ProviderError):
     """Unexpected or invalid upstream response payload."""
+
+
+class RuntimeSandboxError(SkillOrchestratorError):
+    """Raised when the local skill runtime fails."""
+
+
+class RuntimeCommandError(RuntimeSandboxError):
+    """Raised when a CLI command used by the runtime fails."""

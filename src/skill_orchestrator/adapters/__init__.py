@@ -1,6 +1,7 @@
 from skill_orchestrator.adapters.production import (
     ApifyDocsCrawler,
     CivicTrustVerifier,
+    ClawHubCliSandbox,
     ClawHubDocsCrawler,
     ClawHubSkillRegistry,
     ContextualGroundingProvider,
@@ -18,6 +19,7 @@ from skill_orchestrator.adapters.production import (
 __all__ = [
     "ApifyDocsCrawler",
     "CivicTrustVerifier",
+    "ClawHubCliSandbox",
     "ClawHubDocsCrawler",
     "ClawHubSkillRegistry",
     "ContextualGroundingProvider",

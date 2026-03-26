@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Mapping, Optional
@@ -40,6 +41,7 @@ class Settings:
     clawhub_skill_file_path: str = "SKILL.md"
     clawhub_tag: str = "latest"
     clawhub_cache_ttl_seconds: int = 3600
+    clawhub_bin: str = "clawhub"
     apify_base_url: str = DEFAULT_APIFY_BASE_URL
     apify_docs_actor_id: str = "docs-crawler"
     apify_wait_for_finish_seconds: int = 60
@@ -53,6 +55,9 @@ class Settings:
     apify_max_items: int = 25
     apify_download_content: bool = True
     http_timeout_seconds: float = 30.0
+    skill_cache_ttl_seconds: int = 300
+    sandbox_root: str = str(Path(tempfile.gettempdir()) / "autoskill")
+    execution_timeout_seconds: float = 30.0
 
 
 def load_settings(env: Optional[Mapping[str, str]] = None) -> Settings:
@@ -119,6 +124,7 @@ def load_settings(env: Optional[Mapping[str, str]] = None) -> Settings:
         clawhub_cache_ttl_seconds=_read_int(
             source, "CLAWHUB_CACHE_TTL_SECONDS", 3600
         ),
+        clawhub_bin=source.get("CLAWHUB_BIN", "clawhub"),
         apify_base_url=source.get("APIFY_BASE_URL", DEFAULT_APIFY_BASE_URL),
         apify_docs_actor_id=source.get("APIFY_DOCS_ACTOR_ID", "docs-crawler"),
         apify_wait_for_finish_seconds=_read_int(
@@ -136,6 +142,14 @@ def load_settings(env: Optional[Mapping[str, str]] = None) -> Settings:
         apify_max_items=_read_int(source, "APIFY_MAX_ITEMS", 25),
         apify_download_content=_read_bool(source, "APIFY_DOWNLOAD_CONTENT", True),
         http_timeout_seconds=_read_float(source, "HTTP_TIMEOUT_SECONDS", 30.0),
+        skill_cache_ttl_seconds=_read_int(source, "SKILL_CACHE_TTL_SECONDS", 300),
+        sandbox_root=source.get(
+            "SANDBOX_ROOT",
+            str(Path(tempfile.gettempdir()) / "autoskill"),
+        ),
+        execution_timeout_seconds=_read_float(
+            source, "EXECUTION_TIMEOUT_SECONDS", 30.0
+        ),
     )
     return Settings(**values)
 

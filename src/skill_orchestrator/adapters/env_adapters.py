@@ -126,6 +126,9 @@ class EnvSkillCache:
 class EnvRuntimeSandbox:
     """Local sandbox for skill execution."""
 
+    def validate_configuration(self) -> None:
+        return None
+
     async def install(self, skill: Dict[str, Any]) -> bool:
         return True
 

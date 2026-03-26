@@ -7,17 +7,13 @@ import httpx
 
 from skill_orchestrator.adapters.production import (
     ApifyDocsCrawler,
-    CivicTrustVerifier,
+    ClawHubCliSandbox,
     ClawHubDocsCrawler,
     ClawHubSkillRegistry,
-    ContextualGroundingProvider,
     FallbackDocsCrawler,
     FriendliCapabilityDetector,
     InMemorySkillCache,
     LocalDocsCrawler,
-    LocalGroundingProvider,
-    PermissiveTrustVerifier,
-    PrototypeCapabilityDetector,
     RedisPayloadCache,
     RedisSkillCache,
 )
@@ -33,7 +29,7 @@ class ProductionResources:
     grounding_provider: Any
     trust_verifier: Any
     skill_cache: Any
-    runtime_sandbox: Any = None
+    runtime_sandbox: Any
     closeables: Tuple[Any, ...] = ()
 
 
@@ -54,6 +50,7 @@ def build_production_router(
         trust_verifier=resources.trust_verifier,
         skill_cache=resources.skill_cache,
         runtime_sandbox=resources.runtime_sandbox,
+        skill_cache_ttl_seconds=settings.skill_cache_ttl_seconds,
     )
     return router, resources.closeables
 
@@ -86,24 +83,6 @@ def build_production_resources(
             {"Authorization": f"Bearer {settings.apify_api_token}"},
             settings.http_timeout_seconds,
             transports.get("apify"),
-        )
-
-    contextual_client = None
-    if settings.enable_contextual:
-        contextual_client = _build_http_client(
-            settings.contextual_base_url,
-            {"Authorization": f"Bearer {settings.contextual_api_key}"},
-            settings.http_timeout_seconds,
-            transports.get("contextual"),
-        )
-
-    civic_client = None
-    if settings.enable_civic:
-        civic_client = _build_http_client(
-            settings.civic_base_url,
-            {"Authorization": f"Bearer {settings.civic_api_key}"},
-            settings.http_timeout_seconds,
-            transports.get("civic"),
         )
 
     if redis_client is None and settings.enable_redis:
@@ -148,6 +127,7 @@ def build_production_resources(
             clawhub_docs,
             LocalDocsCrawler(),
         )
+
     skill_registry = ClawHubSkillRegistry(
         client=clawhub_client,
         search_limit=settings.clawhub_search_limit,
@@ -158,59 +138,38 @@ def build_production_resources(
         payload_cache=clawhub_payload_cache,
         cache_ttl=settings.clawhub_cache_ttl_seconds,
     )
-    grounding_provider = (
-        ContextualGroundingProvider(
-            client=contextual_client,
-            model=settings.contextual_model,
-        )
-        if settings.enable_contextual and contextual_client is not None
-        else LocalGroundingProvider()
-    )
-    trust_verifier = (
-        CivicTrustVerifier(
-            client=civic_client,
-            verify_path=settings.civic_verify_path,
-        )
-        if settings.enable_civic and civic_client is not None
-        else PermissiveTrustVerifier()
-    )
     skill_cache = (
         RedisSkillCache(redis_client)
         if settings.enable_redis and redis_client is not None
         else InMemorySkillCache()
     )
+    runtime_sandbox = ClawHubCliSandbox(
+        clawhub_bin=settings.clawhub_bin,
+        sandbox_root=settings.sandbox_root,
+        execution_timeout_seconds=settings.execution_timeout_seconds,
+    )
+    runtime_sandbox.validate_configuration()
 
     closeables = [friendli_client, clawhub_client]
-    for resource in (apify_client, contextual_client, civic_client):
+    for resource in (apify_client,):
         if resource is not None:
             closeables.append(resource)
     if settings.enable_redis and redis_client is not None:
         closeables.append(redis_client)
 
-    friendli_detector = FriendliCapabilityDetector(
+    capability_detector = FriendliCapabilityDetector(
         client=friendli_client,
         model=settings.friendli_model,
-    )
-    capability_detector = (
-        friendli_detector
-        if any(
-            (
-                settings.enable_apify,
-                settings.enable_contextual,
-                settings.enable_civic,
-                settings.enable_redis,
-            )
-        )
-        else PrototypeCapabilityDetector(friendli_detector)
     )
 
     resources = ProductionResources(
         capability_detector=capability_detector,
         skill_registry=skill_registry,
         docs_crawler=docs_crawler,
-        grounding_provider=grounding_provider,
-        trust_verifier=trust_verifier,
+        grounding_provider=None,
+        trust_verifier=None,
         skill_cache=skill_cache,
+        runtime_sandbox=runtime_sandbox,
         closeables=tuple(closeables),
     )
     return resources

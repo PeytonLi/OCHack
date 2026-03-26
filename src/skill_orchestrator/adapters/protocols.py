@@ -70,6 +70,10 @@ class RuntimeSandbox(Protocol):
         """Rollback/uninstall a skill from the sandbox."""
         ...
 
+    def validate_configuration(self) -> None:
+        """Fail fast when the runtime is not available for production use."""
+        ...
+
 
 class SkillCache(Protocol):
     """Redis: short-term cross-agent memory."""

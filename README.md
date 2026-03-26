@@ -1,6 +1,6 @@
 # AutoSkill
 
-AutoSkill is a ClawHub/Claude skill backed by the `skill_orchestrator` service in `src/`. It detects capability gaps, searches for reusable skills, synthesizes new ones when needed, verifies trust and safety, and caches both successful resolutions and ClawHub skill downloads for reuse across agents.
+AutoSkill is a ClawHub/Claude skill backed by the `skill_orchestrator` service in `src/`. The production path uses Friendli for capability-gap detection and draft generation, ClawHub for registry search and `SKILL.md` retrieval, Redis for cross-agent caching, and a `clawhub` CLI-backed runtime sandbox for install and execution.
 
 ## Quick Start
 
@@ -10,24 +10,20 @@ Install the skill package:
 clawhub install PeytonLi/OCHack
 ```
 
-Start a new Claude Code session. The SessionStart hook will launch the local service on port `8321`, expose the `auto-skill` command from `skills/auto-skill/SKILL.md`, and keep the service healthy through `GET /health`.
-
-If you want real provider integrations, copy `.env.example` to `.env` and fill in the keys you want to enable. The packaged service can still start without those credentials by falling back to environment-backed stubs.
+Start a new Claude Code session. The SessionStart hook launches the local service on port `8321`, exposes the `auto-skill` command from `skills/auto-skill/SKILL.md`, and keeps the service healthy through `GET /health`.
 
 ## Local Development
 
 ```bash
 pip install -r requirements.txt
-bash scripts/setup-redis.sh
-bash scripts/start-redis.sh start
-python -m pytest tests/ -v
+python -m pytest -q
 python demo.py
 bash scripts/start-service.sh start
 bash scripts/start-service.sh status
 bash scripts/start-service.sh stop
 ```
 
-To run the API directly instead of using the hook:
+To run the API directly:
 
 ```bash
 PYTHONPATH=src uvicorn skill_orchestrator.app:app --host 127.0.0.1 --port 8321
@@ -35,17 +31,25 @@ PYTHONPATH=src uvicorn skill_orchestrator.app:app --host 127.0.0.1 --port 8321
 
 ## Configuration
 
-Set `FRIENDLI_API_KEY` to enable production bootstrap. ClawHub registry search and `SKILL.md` retrieval use the public registry directly, and when Redis is enabled those search/detail/file payloads are cached in Redis as well. Additional providers are opt-in through `ENABLE_APIFY`, `ENABLE_CONTEXTUAL`, `ENABLE_CIVIC`, and `ENABLE_REDIS`; when a provider is disabled, the service falls back to local implementations where possible.
+Production mode requires a valid Friendli key and a working `clawhub` CLI on the host. ClawHub registry search and `SKILL.md` retrieval use the public registry directly. When Redis is enabled, both skill results and ClawHub payload downloads are cached for reuse across agents.
 
-| Variable | Provider | Purpose |
-|----------|----------|---------|
-| `FRIENDLI_API_KEY` | Friendli | Capability gap detection, draft skill generation |
-| `CLAWHUB_BASE_URL` | ClawHub | Registry search and raw `SKILL.md` retrieval (defaults to `https://clawhub.ai`) |
-| `CLAWHUB_CACHE_TTL_SECONDS` | ClawHub + Redis | TTL for cached ClawHub search/detail/file payloads |
-| `APIFY_API_TOKEN` | Apify | Optional legacy docs fallback |
-| `CONTEXTUAL_API_KEY` | Contextual AI | Grounded schema extraction, confidence scoring |
-| `CIVIC_API_KEY` | Civic | Trust verification, policy authority |
-| `REDIS_URL` | Redis | Cross-agent memory cache |
+| Variable | Purpose |
+|----------|---------|
+| `FRIENDLI_API_KEY` | Friendli capability-gap detection and draft generation |
+| `FRIENDLI_BASE_URL` | Friendli API base URL |
+| `FRIENDLI_MODEL` | Friendli model used for detection and draft generation |
+| `CLAWHUB_BASE_URL` | ClawHub registry API base URL |
+| `CLAWHUB_CACHE_TTL_SECONDS` | TTL for cached ClawHub search/detail/file payloads |
+| `CLAWHUB_BIN` | `clawhub` CLI binary name or path |
+| `CLAWHUB_SEARCH_LIMIT` | Max ClawHub search results for retrieval |
+| `CLAWHUB_DOCS_LIMIT` | Max ClawHub docs payloads used for synthesis |
+| `REDIS_URL` | Redis URL for cross-agent caching |
+| `ENABLE_REDIS` | Enable Redis result and payload caches |
+| `SKILL_CACHE_TTL_SECONDS` | TTL for executed skill results |
+| `SANDBOX_ROOT` | Root directory for per-request runtime workspaces |
+| `EXECUTION_TIMEOUT_SECONDS` | Timeout for `clawhub` install and skill execution |
+| `ENABLE_APIFY` | Optional legacy docs fallback after ClawHub docs lookup |
+| `APIFY_API_TOKEN` | Optional Apify token for the legacy docs fallback |
 
 ## API
 
@@ -59,55 +63,36 @@ curl -s -X POST http://localhost:8321/resolve-skill-and-run \
 curl -s http://localhost:8321/metrics
 ```
 
-## Publish to ClawHub
+`POST /resolve-skill-and-run` returns:
 
-The packaged skill manifest lives at `skills/auto-skill/SKILL.md`.
+- `native_capability` when Friendli says the capability is already available in the current toolset
+- `local_cache` when Redis has a prior executed result
+- `clawhub_retrieval` when a published ClawHub skill is installed and executed
+- `synthesis` when Friendli generates a runnable draft package that executes successfully
 
-```bash
-clawhub login
-clawhub inspect .
-clawhub publish .
-```
+`publish_state` remains in the response model for compatibility but is not used in the main production flow.
 
 ## Architecture
 
-```
+```text
 POST /resolve-skill-and-run
-         │
-         ▼
-  CapabilityRouter.resolve_and_run()
-         │
-         ├─ 1. CapabilityDetector (Friendli) - is this capability known?
-         │     └─ known → return cached result
-         │
-         ├─ 2. SkillCache (Redis) - cross-agent memory lookup
-         │     └─ hit → return cached result
-         │
-         ├─ 3. SkillRegistry (ClawHub) - retrieval search
-         │     └─ found → TrustVerifier (Civic) gate → sandbox → return
-         │
-         └─ 4. SynthesisPipeline (no retrieval match)
-               ├─ DocsCrawler (ClawHub `SKILL.md`, optional Apify fallback)
-               ├─ GroundingProvider (Contextual AI) - extract schema + score
-               ├─ CapabilityDetector (Friendli) - generate draft
-               ├─ Confidence threshold check (stricter for high-risk)
-               ├─ License allowlist check
-               ├─ TrustVerifier (Civic) - hard block gate
-               ├─ RuntimeSandbox - install, healthcheck, execute
-               │     └─ healthcheck fail → publish as QUARANTINED
-               └─ Publish as ACTIVE, cache in Redis
-
-GET /health  → service readiness check
-GET /metrics → telemetry counters
+  -> Friendli detect_gap()
+    -> known capability -> native_capability response
+    -> unknown capability
+       -> Redis result cache lookup
+       -> ClawHub registry search
+          -> hit -> clawhub install -> local healthcheck -> run hook -> cache result
+          -> miss
+             -> ClawHub docs crawl (optional Apify fallback)
+             -> Friendli generate_draft()
+             -> validate generated package contract
+             -> license allowlist check
+             -> materialize local package
+             -> local healthcheck -> run hook -> cache result
 ```
 
-### Key Behaviors
+## Notes
 
-1. Retrieval-first: local cache and ClawHub before synthesis
-2. Civic hard block: trust verification failure blocks install, execute, and publish
-3. Quarantine path: policy passes but smoke test fails -> published as quarantined
-4. Retry with backoff: one automatic retry for transient verify/network failures
-5. Partial success: capability-gap report with completed step results when resolution fails
-6. High-risk thresholds: shell, network, filesystem, and exec skills require confidence >= 0.9
-7. License allowlist: only MIT, Apache-2.0, BSD, ISC, Unlicense, and CC0 permitted
-8. Global cache: Redis provides cross-agent memory reuse and caches ClawHub skill downloads
+- The runtime sandbox is Linux-first, but the codebase keeps basic Windows compatibility for local development and tests.
+- Generated drafts must include `name`, `description`, and runnable `SKILL.md` content, either directly as `skill_md` or inside a `files["SKILL.md"]` entry.
+- Redis failures degrade to no-cache behavior; they do not fail the request.

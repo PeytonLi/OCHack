@@ -21,8 +21,9 @@ class FakeCapabilityDetector:
     async def generate_draft(self, capability, context):
         return {
             "name": capability,
-            "code": f"def run(): return '{capability} done'",
-            "version": "0.1.0",
+            "description": f"Run {capability}",
+            "skill_md": f"# {capability}",
+            "files": {"SKILL.md": f"# {capability}"},
         }
 
 
@@ -38,19 +39,6 @@ class TrackingDocsCrawler:
     async def crawl_docs(self, capability: str):
         self.call_count += 1
         return [{"source": "apify", "content": f"Docs for {capability}"}]
-
-
-class FakeGroundingProvider:
-    async def extract_schema(self, raw_docs):
-        return {"schema": "grounded"}
-
-    async def confidence_score(self, skill):
-        return 0.9
-
-
-class ApprovingTrustVerifier:
-    async def verify(self, skill) -> bool:
-        return True
 
 
 class InMemorySkillCache:
@@ -69,6 +57,20 @@ class InMemorySkillCache:
         self.store[capability] = resolution
 
 
+class PassSandbox:
+    async def install(self, skill):
+        return True
+
+    async def healthcheck(self, skill):
+        return True
+
+    async def execute(self, skill, input_data):
+        return {"output": "ok"}
+
+    async def rollback(self, skill):
+        pass
+
+
 # ---------- Tests ----------
 
 @pytest.mark.asyncio
@@ -81,9 +83,10 @@ async def test_second_request_hits_cache():
         capability_detector=FakeCapabilityDetector(),
         skill_registry=EmptySkillRegistry(),
         docs_crawler=docs_crawler,
-        grounding_provider=FakeGroundingProvider(),
-        trust_verifier=ApprovingTrustVerifier(),
+        grounding_provider=None,
+        trust_verifier=None,
         skill_cache=cache,
+        runtime_sandbox=PassSandbox(),
     )
 
     payload = {
@@ -124,9 +127,10 @@ async def test_different_capability_not_cached():
         capability_detector=FakeCapabilityDetector(),
         skill_registry=EmptySkillRegistry(),
         docs_crawler=docs_crawler,
-        grounding_provider=FakeGroundingProvider(),
-        trust_verifier=ApprovingTrustVerifier(),
+        grounding_provider=None,
+        trust_verifier=None,
         skill_cache=cache,
+        runtime_sandbox=PassSandbox(),
     )
 
     transport = ASGITransport(app=app)

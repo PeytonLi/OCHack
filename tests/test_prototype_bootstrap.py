@@ -1,13 +1,30 @@
+import json
+
 import pytest
 from httpx import ASGITransport, AsyncClient, MockTransport, Request, Response
 
+from skill_orchestrator.adapters import production
 from skill_orchestrator.app import create_app
 from skill_orchestrator.models import ResolutionStrategy
 from skill_orchestrator.settings import Settings
 
 
+def _draft_payload() -> str:
+    draft = {
+        "name": "summarize-pdf",
+        "description": "Summarize a PDF document",
+        "skill_md": "# summarize-pdf\n\nSummarize a PDF.",
+        "files": {
+            "SKILL.md": "# summarize-pdf\n\nSummarize a PDF.",
+            "hooks/run-hook.cmd": '@echo {"output":"summary"}',
+        },
+        "dependencies": [],
+    }
+    return json.dumps({"draft": draft})
+
+
 @pytest.mark.asyncio
-async def test_friendli_only_prototype_boots_and_resolves_with_local_fallbacks():
+async def test_friendli_only_boots_and_synthesizes_with_clawhub_docs(monkeypatch):
     friendli_calls = []
     clawhub_calls = []
 
@@ -20,18 +37,7 @@ async def test_friendli_only_prototype_boots_and_resolves_with_local_fallbacks()
             )
         return Response(
             200,
-            json={
-                "choices": [
-                    {
-                        "message": {
-                            "content": (
-                                '{"draft": {"name": "summarize-pdf", "code": "pass", '
-                                '"version": "0.1.0", "dependencies": []}}'
-                            )
-                        }
-                    }
-                ]
-            },
+            json={"choices": [{"message": {"content": _draft_payload()}}]},
         )
 
     def clawhub_handler(request: Request) -> Response:
@@ -42,15 +48,23 @@ async def test_friendli_only_prototype_boots_and_resolves_with_local_fallbacks()
             return Response(200, json={"results": []})
         raise AssertionError(f"Unexpected request: {request.method} {request.url}")
 
+    async def fake_run_subprocess(command, **kwargs):
+        return ('{"output":"summary"}', "")
+
+    monkeypatch.setattr(production, "_run_subprocess", fake_run_subprocess)
+
     app = create_app(
-        Settings(friendli_api_key="friendli-key"),
+        Settings(friendli_api_key="friendli-key", sandbox_root=".autoskill-tests"),
         transports={
             "friendli": MockTransport(friendli_handler),
             "clawhub": MockTransport(clawhub_handler),
         },
     )
 
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://test",
+    ) as client:
         response = await client.post(
             "/resolve-skill-and-run",
             json={
@@ -63,7 +77,11 @@ async def test_friendli_only_prototype_boots_and_resolves_with_local_fallbacks()
     data = response.json()
     assert data["success"] is True
     assert data["resolution_strategy"] == ResolutionStrategy.SYNTHESIS.value
-    assert friendli_calls == ["/serverless/v1/chat/completions"]
+    assert data["result"] == {"output": "summary"}
+    assert friendli_calls == [
+        "/serverless/v1/chat/completions",
+        "/serverless/v1/chat/completions",
+    ]
     assert clawhub_calls == [
         "/api/v1/skills/summarize-pdf",
         "/api/v1/search",
