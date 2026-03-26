@@ -133,7 +133,14 @@ async def test_apify_crawler_runs_actor_then_fetches_dataset_items():
     seen = []
 
     def handler(request: httpx.Request) -> httpx.Response:
-        seen.append((request.method, request.url.path, request.url.params))
+        seen.append(
+            (
+                request.method,
+                request.url.path,
+                request.url.params,
+                json.loads(request.content.decode()),
+            )
+        )
         return httpx.Response(
             200,
             json=[{"source": "apify", "content": "Documentation"}],
@@ -148,12 +155,24 @@ async def test_apify_crawler_runs_actor_then_fetches_dataset_items():
             client=client,
             actor_id="docs-crawler",
             wait_for_finish_seconds=45,
+            intended_usage_template="Investigate capability {capability}",
+            improvement_suggestions="Return relevant docs",
+            contact="ops@example.com",
+            max_items=7,
+            download_content=False,
         )
         docs = await adapter.crawl_docs("summarize-pdf")
 
     assert docs == [{"source": "apify", "content": "Documentation"}]
     assert seen[0][1] == "/v2/acts/docs-crawler/run-sync-get-dataset-items"
     assert seen[0][2]["waitForFinish"] == "45"
+    assert seen[0][3] == {
+        "sp_intended_usage": "Investigate capability summarize-pdf",
+        "sp_improvement_suggestions": "Return relevant docs",
+        "sp_contact": "ops@example.com",
+        "maxItems": 7,
+        "downloadContent": False,
+    }
     assert len(seen) == 1
 
 

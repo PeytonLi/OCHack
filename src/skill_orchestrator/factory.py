@@ -10,7 +10,12 @@ from skill_orchestrator.adapters.production import (
     CivicTrustVerifier,
     ContextualGroundingProvider,
     FriendliCapabilityDetector,
+    InMemorySkillCache,
+    LocalDocsCrawler,
+    LocalGroundingProvider,
     NullSkillRegistry,
+    PermissiveTrustVerifier,
+    PrototypeCapabilityDetector,
     RedisSkillCache,
 )
 from skill_orchestrator.router import CapabilityRouter
@@ -19,12 +24,12 @@ from skill_orchestrator.settings import Settings
 
 @dataclass
 class ProductionResources:
-    capability_detector: FriendliCapabilityDetector
+    capability_detector: Any
     skill_registry: NullSkillRegistry
-    docs_crawler: ApifyDocsCrawler
-    grounding_provider: ContextualGroundingProvider
-    trust_verifier: CivicTrustVerifier
-    skill_cache: RedisSkillCache
+    docs_crawler: Any
+    grounding_provider: Any
+    trust_verifier: Any
+    skill_cache: Any
     runtime_sandbox: Any = None
     closeables: Tuple[Any, ...] = ()
 
@@ -64,57 +69,107 @@ def build_production_resources(
         settings.http_timeout_seconds,
         transports.get("friendli"),
     )
-    apify_client = _build_http_client(
-        settings.apify_base_url,
-        {"Authorization": f"Bearer {settings.apify_api_token}"},
-        settings.http_timeout_seconds,
-        transports.get("apify"),
-    )
-    contextual_client = _build_http_client(
-        settings.contextual_base_url,
-        {"Authorization": f"Bearer {settings.contextual_api_key}"},
-        settings.http_timeout_seconds,
-        transports.get("contextual"),
-    )
-    civic_client = _build_http_client(
-        settings.civic_base_url,
-        {"Authorization": f"Bearer {settings.civic_api_key}"},
-        settings.http_timeout_seconds,
-        transports.get("civic"),
-    )
 
-    if redis_client is None:
+    apify_client = None
+    if settings.enable_apify:
+        apify_client = _build_http_client(
+            settings.apify_base_url,
+            {"Authorization": f"Bearer {settings.apify_api_token}"},
+            settings.http_timeout_seconds,
+            transports.get("apify"),
+        )
+
+    contextual_client = None
+    if settings.enable_contextual:
+        contextual_client = _build_http_client(
+            settings.contextual_base_url,
+            {"Authorization": f"Bearer {settings.contextual_api_key}"},
+            settings.http_timeout_seconds,
+            transports.get("contextual"),
+        )
+
+    civic_client = None
+    if settings.enable_civic:
+        civic_client = _build_http_client(
+            settings.civic_base_url,
+            {"Authorization": f"Bearer {settings.civic_api_key}"},
+            settings.http_timeout_seconds,
+            transports.get("civic"),
+        )
+
+    if redis_client is None and settings.enable_redis:
         from redis.asyncio import from_url
 
         redis_client = from_url(settings.redis_url, decode_responses=True)
 
-    resources = ProductionResources(
-        capability_detector=FriendliCapabilityDetector(
-            client=friendli_client,
-            model=settings.friendli_model,
-        ),
-        skill_registry=NullSkillRegistry(),
-        docs_crawler=ApifyDocsCrawler(
+    docs_crawler = (
+        ApifyDocsCrawler(
             client=apify_client,
             actor_id=settings.apify_docs_actor_id,
             wait_for_finish_seconds=settings.apify_wait_for_finish_seconds,
-        ),
-        grounding_provider=ContextualGroundingProvider(
+            intended_usage_template=settings.apify_intended_usage_template,
+            improvement_suggestions=settings.apify_improvement_suggestions,
+            contact=settings.apify_contact,
+            max_items=settings.apify_max_items,
+            download_content=settings.apify_download_content,
+        )
+        if settings.enable_apify and apify_client is not None
+        else LocalDocsCrawler()
+    )
+    grounding_provider = (
+        ContextualGroundingProvider(
             client=contextual_client,
             model=settings.contextual_model,
-        ),
-        trust_verifier=CivicTrustVerifier(
+        )
+        if settings.enable_contextual and contextual_client is not None
+        else LocalGroundingProvider()
+    )
+    trust_verifier = (
+        CivicTrustVerifier(
             client=civic_client,
             verify_path=settings.civic_verify_path,
-        ),
-        skill_cache=RedisSkillCache(redis_client),
-        closeables=(
-            friendli_client,
-            apify_client,
-            contextual_client,
-            civic_client,
-            redis_client,
-        ),
+        )
+        if settings.enable_civic and civic_client is not None
+        else PermissiveTrustVerifier()
+    )
+    skill_cache = (
+        RedisSkillCache(redis_client)
+        if settings.enable_redis and redis_client is not None
+        else InMemorySkillCache()
+    )
+
+    closeables = [friendli_client]
+    for resource in (apify_client, contextual_client, civic_client):
+        if resource is not None:
+            closeables.append(resource)
+    if settings.enable_redis and redis_client is not None:
+        closeables.append(redis_client)
+
+    friendli_detector = FriendliCapabilityDetector(
+        client=friendli_client,
+        model=settings.friendli_model,
+    )
+    capability_detector = (
+        friendli_detector
+        if any(
+            (
+                settings.enable_apify,
+                settings.enable_contextual,
+                settings.enable_civic,
+                settings.enable_redis,
+            )
+        )
+        else PrototypeCapabilityDetector(friendli_detector)
+    )
+
+    resources = ProductionResources(
+        capability_detector=capability_detector,
+        skill_registry=NullSkillRegistry(),
+        docs_crawler=docs_crawler,
+        grounding_provider=grounding_provider,
+        trust_verifier=trust_verifier,
+        skill_cache=skill_cache,
+        closeables=tuple(closeables),
     )
     return resources
 

@@ -45,3 +45,6 @@ Thumbs.db
 # AutoSkill service
 *.pid
 .service.log
+
+# Local Redis
+.redis/

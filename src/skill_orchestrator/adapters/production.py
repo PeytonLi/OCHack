@@ -57,9 +57,79 @@ class RedisSkillCache:
         return f"skill-resolution:{capability}"
 
 
+class InMemorySkillCache:
+    def __init__(self):
+        self.store: Dict[str, Dict[str, Any]] = {}
+
+    async def get(self, capability: str) -> Optional[Dict[str, Any]]:
+        return self.store.get(capability)
+
+    async def set(
+        self, capability: str, resolution: Dict[str, Any], ttl: int = 300
+    ) -> None:
+        self.store[capability] = resolution
+
+
 class NullSkillRegistry:
     async def search(self, capability: str) -> None:
         return None
+
+
+class LocalDocsCrawler:
+    async def crawl_docs(self, capability: str) -> List[Dict[str, Any]]:
+        return [
+            {
+                "source": "local-fallback",
+                "content": f"No external documentation crawler configured for capability: {capability}",
+            }
+        ]
+
+
+class LocalGroundingProvider:
+    async def extract_schema(self, raw_docs: List[Dict[str, Any]]) -> Dict[str, Any]:
+        fields = []
+        if raw_docs:
+            fields.append("context")
+        return {"schema": "prototype", "fields": fields}
+
+    async def confidence_score(self, skill: Dict[str, Any]) -> float:
+        return 0.95 if isinstance(skill, dict) and skill else 0.0
+
+
+class PermissiveTrustVerifier:
+    async def verify(self, skill: Dict[str, Any]) -> bool:
+        return True
+
+
+class PrototypeCapabilityDetector:
+    def __init__(self, delegate: "FriendliCapabilityDetector"):
+        self.delegate = delegate
+
+    async def detect_gap(self, capability: str) -> bool:
+        # Prototype mode always treats requests as unresolved so synthesis runs.
+        return True
+
+    async def generate_draft(
+        self, capability: str, context: Dict[str, Any]
+    ) -> Optional[Dict[str, Any]]:
+        try:
+            draft = await self.delegate.generate_draft(capability, context)
+        except Exception:
+            draft = None
+
+        if isinstance(draft, dict) and draft:
+            draft.setdefault("name", capability)
+            draft.setdefault("version", "0.1.0")
+            draft.setdefault("dependencies", [])
+            return draft
+
+        return {
+            "name": capability,
+            "description": f"Prototype draft generated locally for capability: {capability}",
+            "code": "pass",
+            "version": "0.1.0",
+            "dependencies": [],
+        }
 
 
 class HttpJsonAdapter:
@@ -119,13 +189,36 @@ class ApifyDocsCrawler(HttpJsonAdapter):
         client: httpx.AsyncClient,
         actor_id: str,
         wait_for_finish_seconds: int = 60,
+        intended_usage_template: str = (
+            "Resolve or synthesize a skill for capability: {capability}."
+        ),
+        improvement_suggestions: str = (
+            "Return structured skill metadata and detailed content relevant to the requested capability."
+        ),
+        contact: str = "",
+        max_items: int = 25,
+        download_content: bool = True,
     ):
         super().__init__(client, "Apify")
         self.actor_id = actor_id
         self.wait_for_finish_seconds = wait_for_finish_seconds
+        self.intended_usage_template = intended_usage_template
+        self.improvement_suggestions = improvement_suggestions
+        self.contact = contact
+        self.max_items = max_items
+        self.download_content = download_content
 
     async def crawl_docs(self, capability: str) -> List[Dict[str, Any]]:
-        run_payload = {"capability": capability}
+        run_payload = {
+            "sp_intended_usage": self.intended_usage_template.format(
+                capability=capability
+            ),
+            "sp_improvement_suggestions": self.improvement_suggestions,
+            "maxItems": self.max_items,
+            "downloadContent": self.download_content,
+        }
+        if self.contact:
+            run_payload["sp_contact"] = self.contact
         items = await self._post_json(
             f"/acts/{self.actor_id}/run-sync-get-dataset-items",
             run_payload,

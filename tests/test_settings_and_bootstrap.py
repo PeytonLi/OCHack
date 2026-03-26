@@ -6,6 +6,11 @@ from skill_orchestrator.adapters.production import (
     CivicTrustVerifier,
     ContextualGroundingProvider,
     FriendliCapabilityDetector,
+    InMemorySkillCache,
+    LocalDocsCrawler,
+    LocalGroundingProvider,
+    PermissiveTrustVerifier,
+    PrototypeCapabilityDetector,
     NullSkillRegistry,
     RedisSkillCache,
 )
@@ -34,16 +39,22 @@ def test_load_settings_applies_defaults():
     settings = load_settings(
         {
             "FRIENDLI_API_KEY": "friendli-key",
-            "APIFY_API_TOKEN": "apify-key",
-            "CONTEXTUAL_API_KEY": "contextual-key",
-            "CIVIC_API_KEY": "civic-key",
-            "REDIS_URL": "redis://localhost:6379",
         }
     )
 
     assert settings.friendli_base_url == "https://api.friendli.ai/serverless/v1"
     assert settings.apify_base_url == "https://api.apify.com/v2"
+    assert settings.enable_apify is False
+    assert settings.enable_contextual is False
+    assert settings.enable_civic is False
+    assert settings.enable_redis is False
     assert settings.apify_wait_for_finish_seconds == 60
+    assert (
+        settings.apify_intended_usage_template
+        == "Resolve or synthesize a skill for capability: {capability}."
+    )
+    assert settings.apify_max_items == 25
+    assert settings.apify_download_content is True
     assert settings.http_timeout_seconds == 30.0
 
 
@@ -91,15 +102,22 @@ def test_load_settings_env_overrides_dotenv_placeholders(monkeypatch, tmp_path):
     settings = load_settings(
         {
             "FRIENDLI_API_KEY": "friendli-key",
-            "APIFY_API_TOKEN": "apify-key",
-            "CONTEXTUAL_API_KEY": "contextual-key",
-            "CIVIC_API_KEY": "civic-key",
             "REDIS_URL": "redis://cache:6379",
         }
     )
 
     assert settings.friendli_api_key == "friendli-key"
     assert settings.redis_url == "redis://cache:6379"
+
+
+def test_load_settings_requires_enabled_optional_provider_keys():
+    with pytest.raises(ConfigurationError):
+        load_settings(
+            {
+                "FRIENDLI_API_KEY": "friendli-key",
+                "ENABLE_APIFY": "true",
+            }
+        )
 
 
 def test_create_app_wires_production_adapters():
@@ -110,6 +128,10 @@ def test_create_app_wires_production_adapters():
             "CONTEXTUAL_API_KEY": "contextual-key",
             "CIVIC_API_KEY": "civic-key",
             "REDIS_URL": "redis://localhost:6379",
+            "ENABLE_APIFY": "true",
+            "ENABLE_CONTEXTUAL": "true",
+            "ENABLE_CIVIC": "true",
+            "ENABLE_REDIS": "true",
         }
     )
 
@@ -139,3 +161,16 @@ def test_create_app_wires_production_adapters():
     assert isinstance(router.grounding, ContextualGroundingProvider)
     assert isinstance(router.trust, CivicTrustVerifier)
     assert isinstance(router.cache, RedisSkillCache)
+
+
+def test_create_app_defaults_to_local_fallbacks_for_disabled_providers():
+    settings = load_settings({"FRIENDLI_API_KEY": "friendli-key"})
+    app = create_app(settings)
+
+    router = app.state.router
+    assert isinstance(router.detector, PrototypeCapabilityDetector)
+    assert isinstance(router.registry, NullSkillRegistry)
+    assert isinstance(router.docs_crawler, LocalDocsCrawler)
+    assert isinstance(router.grounding, LocalGroundingProvider)
+    assert isinstance(router.trust, PermissiveTrustVerifier)
+    assert isinstance(router.cache, InMemorySkillCache)

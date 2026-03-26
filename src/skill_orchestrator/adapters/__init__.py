@@ -3,7 +3,12 @@ from skill_orchestrator.adapters.production import (
     CivicTrustVerifier,
     ContextualGroundingProvider,
     FriendliCapabilityDetector,
+    InMemorySkillCache,
+    LocalDocsCrawler,
+    LocalGroundingProvider,
     NullSkillRegistry,
+    PermissiveTrustVerifier,
+    PrototypeCapabilityDetector,
     RedisSkillCache,
 )
 
@@ -12,6 +17,11 @@ __all__ = [
     "CivicTrustVerifier",
     "ContextualGroundingProvider",
     "FriendliCapabilityDetector",
+    "InMemorySkillCache",
+    "LocalDocsCrawler",
+    "LocalGroundingProvider",
     "NullSkillRegistry",
+    "PermissiveTrustVerifier",
+    "PrototypeCapabilityDetector",
     "RedisSkillCache",
 ]

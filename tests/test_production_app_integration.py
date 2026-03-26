@@ -33,6 +33,10 @@ def _settings() -> Settings:
         contextual_api_key="contextual-key",
         civic_api_key="civic-key",
         redis_url="redis://localhost:6379",
+        enable_apify=True,
+        enable_contextual=True,
+        enable_civic=True,
+        enable_redis=True,
     )
 
 
